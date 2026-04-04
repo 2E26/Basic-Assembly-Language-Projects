@@ -120,7 +120,7 @@ section .bss
   fd2:		resd	1				; think really hard about this one...
   
   inbuf:	resb	522				; empty bytes to be used for input data
-  inputptr:	resb	1				; used to track position in the input buffer
+  inputptr:	resw	1				; used to track position in the input buffer
   
   outbuf:	resb	256				; output buffer to be filled up with data
   outputptr:	resb	1				; used to track position in the output buffer
@@ -137,14 +137,14 @@ _start:
 		mov	rbx, [rsp]			; load the number of arguments into rbx
 		mov	qword [rel argc], rbx		; store it in memory
 		cmp	rbx, 3				; minimum number of arguments is 3
-		jb	.usageonly			; if arguments insufficient, display usage messages as error
+		jne	.usageonly			; if arguments insufficient, display usage messages as error
 		mov	rsi, [rsp + 16]			; get the first argument otherwise
 		mov	qword [rel arg1p], rsi		; save it in memory
 		mov	rsi, [rsp + 24]			; get the second argument pointer
 		mov	qword [rel arg2p], rsi		; save it in memory
 
 .mainroutine:
-  ; translates HEX format into raw binary. Draws one line of text from the input file (max 96 characters)
+  ; translates HEX format into raw binary. Draws one line of text from the input file (max 261 characters)
   ; and translates it into raw data.
 		mov	rdi, [rel arg1p]		; load the address for the input file name
 		mov	rsi, 0				; set rsi = 0 (read-only file)
@@ -173,6 +173,8 @@ _start:
 		je	.record01			; process the following text as a record
 		cmp	al, 0x0A			; check if byte was endline
 		je	.loop01				; if it is, ignore it and keep going
+		cmp	al, 0x0D			; check if byte was carriage return
+		je	.loop01				; if so, ignore and keep going
 		jmp	.dataerror			; if it reads anything else, error out
 
 .comment01:	movzx	edx, 1				; if the program reads a byte '/'
@@ -181,7 +183,7 @@ _start:
 		js	.readerror
 		jz	.donewithfiles
 		cmp	al, 0x2F			; if second char is not '/' then go
-		jne	.loop01				; back to beginning of loop
+		jne	.dataerror			; to error handler and quit
 .comment02:	call	readfile			; otherwise, we are reading a comment
 		test	rax, rax			; so keep reading until we read an
 		js	.readerror			; endline character and skip everything
@@ -200,9 +202,9 @@ _start:
 		cmp	al, 0x0A			; endline character?
 		je	.record03			; if so, go down to process the record
 		mov	byte [rdi + rbx], al		; store the byte in the input buffer
-		inc	bl				; increase input buffer index
+		inc	bx				; increase input buffer index
 		jmp	.record02			; go back and record another byte
-.record03:	mov	byte [rel inputptr], bl		; save the value of bl
+.record03:	mov	word [rel inputptr], bx		; save the value of bx
 		xor	rbx, rbx			; clear the buffer index again
 		xor	rcx, rcx			; clear the output buffer index
 		xor	rdx, rdx			; clear input data register
@@ -230,8 +232,16 @@ _start:
 		call	TexttoDB			
 		test	rax, rax
 		js	.dataerror
-		cmp	al, 1				; is this a generic data field?
-		;jz	.				; if zero, prepare to end program
+		cmp	al, 0				; is this a generic data field?
+		;jne	.				; if not, handle other types
+		
+.record05:	call	readbyte			; look at a data byte
+		call	TexttoDB
+		test	rax, rax
+		js	.dataerror
+		inc	cl				; increase the counter
+		cmp	cl, byte [rel bytesinrec]	; see if we have read all the bytes
+		jne	.record05
 
 		
 
@@ -304,7 +314,8 @@ printtext:
 ;	         = 0: end of file reached
 ;	         < 0: error
 ;--------------------------------------------------------------------
-readfile:	mov	edi, [rel fd1]
+readfile:	
+		mov	edi, [rel fd1]
 		lea	rsi, [rel inbuf]
 		xor	rax, rax			; rax = 0 sys_read
 		syscall
@@ -320,7 +331,8 @@ readfile:	mov	edi, [rel fd1]
 ; Outputs: RAX - > 0: number of bytes written
 ;	         < 0: error
 ;--------------------------------------------------------------------
-writefile:	mov	edi, [rel fd2]
+writefile:	
+		mov	edi, [rel fd2]
 		lea	rsi, [rel outbuf]
 		mov	rax, 1				; rax = 1 sys_write
 		syscall
@@ -335,7 +347,8 @@ writefile:	mov	edi, [rel fd2]
 ; Destroys: RAX
 ; Outputs: none
 ;--------------------------------------------------------------------
-closefile:	mov	rax, 3				; rax = 3 sys_close
+closefile:	
+		mov	rax, 3				; rax = 3 sys_close
 		syscall
 		ret
 
@@ -394,12 +407,11 @@ TexttoDB:
 		je	.TTDBnoloop			; if it already is, don't loop again
 		mov	dh, 0x7F			; make dh 'DEL' because we already used it
 		shl	al, 4				; multiply al by 16
-		mov ah, al				; copy al into ah
+		mov	ah, al				; copy al into ah
 		mov	al, dl				; get the lower byte
 		jmp	.TTDBscreen			; go again one more time
-.TTDBnoloop:	add	al, ah		; 	
+.TTDBnoloop:	add	al, ah
 		and	rax, 0x00000000000000FF		; ensure rax only contains data in al
 		ret					; if we got here, return with al = byte
 .TTDBerror:	mov	rax, -1				; return 0xFFFFFFFFFFFFFFFF if failed
 		ret
-			
