@@ -132,7 +132,7 @@ section .bss
 section .text
 _start:
 		xor	rax, rax			; clear A register
-		mov	dword [rel bytesread], 0	; clear memory spots
+		mov	dword [rel recordsread], 0	; clear memory spots
 		mov	dword [rel byteswritten], 0
 		mov	rbx, [rsp]			; load the number of arguments into rbx
 		mov	qword [rel argc], rbx		; store it in memory
@@ -221,10 +221,10 @@ _start:
 		mov	word [rel address], ax		; save al in memory
 		call	readbyte
 		call	TexttoDB
-		text	rax, rax
+		test	rax, rax
 		js	.dataerror
 		shl	ax, 8				; move al to ah
-		add	word [rel address], ax		; save high byte of address into memory
+		add	word [rel address], ax		; save low byte of address into memory
 
 		call	readbyte			; field type is next
 		call	TexttoDB			
@@ -232,6 +232,9 @@ _start:
 		js	.dataerror
 		cmp	al, 1				; is this a generic data field?
 		;jz	.				; if zero, prepare to end program
+
+		
+
 
 .exitprogram:	mov	eax, 60				; set up the function to exit
   		xor	edi, edi			; and go back to the command line
@@ -302,7 +305,7 @@ printtext:
 ;	         < 0: error
 ;--------------------------------------------------------------------
 readfile:	mov	edi, [rel fd1]
-		lea	rsi, [rel infilebuf]
+		lea	rsi, [rel inbuf]
 		xor	rax, rax			; rax = 0 sys_read
 		syscall
 		ret
