@@ -394,9 +394,11 @@ TexttoDB:
 		je	.TTDBnoloop			; if it already is, don't loop again
 		mov	dh, 0x7F			; make dh 'DEL' because we already used it
 		shl	al, 4				; multiply al by 16
-		add	al, dl				; get the lower byte
+		mov ah, al				; copy al into ah
+		mov	al, dl				; get the lower byte
 		jmp	.TTDBscreen			; go again one more time
-.TTDBnoloop:	and	rax, 0x00000000000000FF		; ensure rax only contains data in al
+.TTDBnoloop:	add	al, ah		; 	
+		and	rax, 0x00000000000000FF		; ensure rax only contains data in al
 		ret					; if we got here, return with al = byte
 .TTDBerror:	mov	rax, -1				; return 0xFFFFFFFFFFFFFFFF if failed
 		ret
