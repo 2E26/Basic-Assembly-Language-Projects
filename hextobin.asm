@@ -143,9 +143,8 @@ _start:
 		mov	rsi, [rsp + 24]			; get the second argument pointer
 		mov	qword [rel arg2p], rsi		; save it in memory
 
-.mainroutine:
-  ; translates HEX format into raw binary. Draws one line of text from the input file (max 261 characters)
-  ; and translates it into raw data.
+.mainroutine:	; open the input file as read-only and output file as write only. Save the
+		; file descriptors for later use.
 		mov	rdi, [rel arg1p]		; load the address for the input file name
 		mov	rsi, 0				; set rsi = 0 (read-only file)
 		xor	rdx, rdx			; clear rdx to avoid interference
@@ -162,7 +161,9 @@ _start:
 		js	.fileerror
 		mov	dword [rel fd2], eax		; save the file descriptor
 
-.loop01:	movzx	edx, 1				; set quantity of bytes to read to one
+.loop01:	; read bytes from input file one at a time, check for key characters to steer
+		; operation of program. Error out if we read anything that isn't allowed.
+		movzx	edx, 1				; set quantity of bytes to read to one
 		call	readfile			; read one byte from input file
 		test	rax, rax			; check to see if file read succeeded
 		js	.readerror			; error out if not
@@ -177,74 +178,112 @@ _start:
 		je	.loop01				; if so, ignore and keep going
 		jmp	.dataerror			; if it reads anything else, error out
 
-.comment01:	movzx	edx, 1				; if the program reads a byte '/'
+.comment01:	; determine if we have two '/' characters
+		movzx	edx, 1				; if the program reads a byte '/'
 		call	readfile			; check if next one is '/' as well
 		test	rax, rax
 		js	.readerror
 		jz	.donewithfiles
 		cmp	al, 0x2F			; if second char is not '/' then go
 		jne	.dataerror			; to error handler and quit
-.comment02:	call	readfile			; otherwise, we are reading a comment
+.comment02:	; if we do, keep reading bytes until end of line.
+		call	readfile			; otherwise, we are reading a comment
 		test	rax, rax			; so keep reading until we read an
 		js	.readerror			; endline character and skip everything
-		jz	.donewithfiles			; else
-		cmp	al, 0x0A
-		jne	.comment02
-		jmp	.loop01
+		jz	.donewithfiles			; else.
+		cmp	al, 0x0D			; check if byte read is CR or LF
+		je	.loop01				; if so, go back and keep reading
+		cmp	al, 0x0A			; otherwise ignore bytes until we
+		je	.loop01				; get to one of the two endline chars
+		jmp	.comment02
 
-.record01:	xor	rbx, rbx			; use rbx as a buffer index
+.record01:	; initialize data for reading a record
+		xor	rbx, rbx			; use rbx as a buffer index
 		lea	rdi, [rel inbuf]		; point rdi at input buffer
-.record02:	movzx	edx, 1				; withdraw one byte
+.record02:	; read bytes and store in buffer until we get to end of line
+		movzx	edx, 1				; withdraw one byte
 		call	readfile
 		test	rax, rax			; standard error handler
 		js	.readerror
 		jz	.donewithfiles
 		cmp	al, 0x0A			; endline character?
 		je	.record03			; if so, go down to process the record
+		cmp	al, 0x0D			; same check for CR character used in
+		je	.record 03			; some data conventions
 		mov	byte [rdi + rbx], al		; store the byte in the input buffer
 		inc	bx				; increase input buffer index
 		jmp	.record02			; go back and record another byte
-.record03:	mov	word [rel inputptr], bx		; save the value of bx
+.record03:	; reinitialize data to convert ASCII data to binary data and
+		; store it in the output buffer
+		mov	word [rel inputptr], bx		; save the value of bx
 		xor	rbx, rbx			; clear the buffer index again
 		xor	rcx, rcx			; clear the output buffer index
 		xor	rdx, rdx			; clear input data register
+		xor	r8, r8				; clear tally counter for checksum
 		lea	rsi, [rel inbuf]		; rearrange buffer pointers
 		lea	rdi, [rel outbuf]
-.record04:	call	readbyte			; load dx with two ASCII chars
+.record04:	; read ASCII pairs from the input buffer and write the numerical
+		; data in the output buffer.
+		call	readbyte			; load dx with two ASCII chars
 		call	TexttoDB			; transform dx into a number value
 		test	rax, rax			; check validity
 		js	.dataerror			; and error out if invalid
 		mov	byte [rel bytesinrec], al	; save number of bytes in record
-		
+		add	r8d, eax			; add to tally
 		call	readbyte			; address data is next
 		call	TexttoDB
 		test	rax, rax
 		js	.dataerror
 		mov	word [rel address], ax		; save al in memory
+		add	r8d, eax			; add to tally
 		call	readbyte
 		call	TexttoDB
 		test	rax, rax
 		js	.dataerror
 		shl	ax, 8				; move al to ah
 		add	word [rel address], ax		; save low byte of address into memory
-
+		add	r8d, eax			; add to tally
 		call	readbyte			; field type is next
 		call	TexttoDB			
 		test	rax, rax
 		js	.dataerror
-		cmp	al, 0				; is this a generic data field?
-		;jne	.				; if not, handle other types
-		
-.record05:	call	readbyte			; look at a data byte
+		add	r8d, eax			; add to tally
+		cmp	al, 1				; is this an EOF data field?
+		je	.record07			; if not, write bytes to the file
+.record05:	; go through the data field and read the number of bytes indicated
+		; on the record. Store them in the output buffer
+		call	readbyte			; look at a data byte
 		call	TexttoDB
 		test	rax, rax
 		js	.dataerror
+		mov	byte [rdi + rcx], al		; if it is valid, place it in output buffer
+		add	r8d, eax			; add to tally
 		inc	cl				; increase the counter
 		cmp	cl, byte [rel bytesinrec]	; see if we have read all the bytes
 		jne	.record05
+.record06:	; read the final byte, the checksum. Use the tally collected
+		; during all of the other reads to compare to the checksum
+		; and determine if the read was valid.
+		and	r8, 255				; clear top seven bytes of r8
+		neg	r8b				; two's complement of r8b
+		call	readbyte			; grab the checksum chars
+		call	TexttoDB
+		test	rax, rax
+		js	.dataerror
+		cmp	r8b, al				; see if file checksum matches calculated checksum
+		jne	.dataerror			; 
+		inc	dword [rel recordsread], 1	; if we've made it this far we add to the number
+		jmp	.write01			; add to the number of successful records read	
+.record07:	; if we have encountered the end-of-file data record (type 01), add to the number of
+		; successfully written records and finish with program.
+		inc	dword [rel recordsread], 1
+		jmp	.donewithfiles
 
-		
-
+.write01:	mov	rdx, rcx			; load number of bytes to write in rdx
+		call	writefile			; and write them
+		test	rax, rax			; if write was unsuccessful then error out
+		js	.writeerror
+		jmp	.loop01				; otherwise, go back to beginning of function
 
 .exitprogram:	mov	eax, 60				; set up the function to exit
   		xor	edi, edi			; and go back to the command line
