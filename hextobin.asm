@@ -209,7 +209,7 @@ _start:
 		cmp	al, 0x0A			; endline character?
 		je	.record03			; if so, go down to process the record
 		cmp	al, 0x0D			; same check for CR character used in
-		je	.record 03			; some data conventions
+		je	.record03			; some data conventions
 		mov	byte [rdi + rbx], al		; store the byte in the input buffer
 		inc	bx				; increase input buffer index
 		jmp	.record02			; go back and record another byte
@@ -273,7 +273,7 @@ _start:
 		cmp	r8b, al				; see if file checksum matches calculated checksum
 		jne	.dataerror			; 
 		inc	dword [rel recordsread], 1	; if we've made it this far we add to the number
-		jmp	.write01			; add to the number of successful records read	
+		jmp	.write01			; of successful records read	
 .record07:	; if we have encountered the end-of-file data record (type 01), add to the number of
 		; successfully written records and finish with program.
 		inc	dword [rel recordsread], 1
@@ -450,7 +450,7 @@ TexttoDB:
 		mov	al, dl				; get the lower byte
 		jmp	.TTDBscreen			; go again one more time
 .TTDBnoloop:	add	al, ah
-		and	rax, 0x00000000000000FF		; ensure rax only contains data in al
+		and	rax, 255			; ensure rax only contains data in al
 		ret					; if we got here, return with al = byte
 .TTDBerror:	mov	rax, -1				; return 0xFFFFFFFFFFFFFFFF if failed
 		ret
