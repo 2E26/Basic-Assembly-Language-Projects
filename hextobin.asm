@@ -283,6 +283,7 @@ _start:
 		call	writefile			; and write them
 		test	rax, rax			; if write was unsuccessful then error out
 		js	.writeerror
+		add	dword [rel byteswritten], edx	; add to the number of total bytes written
 		jmp	.loop01				; otherwise, go back to beginning of function
 
 .exitprogram:	mov	eax, 60				; set up the function to exit
@@ -450,7 +451,7 @@ TexttoDB:
 		mov	al, dl				; get the lower byte
 		jmp	.TTDBscreen			; go again one more time
 .TTDBnoloop:	add	al, ah
-		and	rax, 255			; ensure rax only contains data in al
+		and	rax, 0x00000000000000FF		; ensure rax only contains data in al
 		ret					; if we got here, return with al = byte
 .TTDBerror:	mov	rax, -1				; return 0xFFFFFFFFFFFFFFFF if failed
 		ret
