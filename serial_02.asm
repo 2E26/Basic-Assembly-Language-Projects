@@ -76,16 +76,23 @@ section .data
   usage5:	db	"Only *.hex files are considered valid", 0x0A
   u5len:	equ	$ - usage5
   
-  error1:	db	"File error - invalid file name.", 0x0A
+  op1:		db	"Opening file name: "
+  op1len:	equ	$ - op1
+  
+  error1:	db	"Error - invalid file name.", 0x0A
   error1len:	equ	$ - error1
-  error2:	db	"File error - read failed.", 0x0A
+  error2:	db	"Error - read failed.", 0x0A
   error2len:	equ	$ - error2
-  error3:	db	"File error - write failed.", 0x0A
+  error3:	db	"Error - write failed.", 0x0A
   error3len:	equ	$ - error3
   error4:	db	"Error - HEX file not valid", 0x0A
   error4len:	equ	$ - error4
   error5:	db	"Error - input invalid.", 0x0A
   error5len:	equ	$ - error5
+  error6:	db	"Error - problem opening file.", 0x0A
+  error6len:	equ	$ - error6
+  error7:	db	"Error - no HEX data in file.", 0x0A
+  error7len:	equ	$ - error7
   
   success1:	db	"HEX file is valid.", 0x0A, 0x0A
   success1len:	equ	$ - success1
@@ -103,6 +110,8 @@ section .data
 
   eofline:	db	":00000001FF", 0x0A
   eoflinelen:	equ	$ - eofline
+  
+  endl:		db	0x0A
 
 section .bss
 
@@ -116,7 +125,8 @@ section .bss
   inputptr:	resb	1				; used to track position in the input buffer
   outbuf:	resb	256				; output buffer to be filled up with data
   outputptr:	resb	1				; used to track position in the output buffer
-  bytesread:	resw	1				; number of bytes that were read from the input file
+  byteqty:	resb	1				; number of bytes in the current quantity
+  bytesread:	resw	1				; number of data bytes that were read from the input file
   recordsread:	resw	1				; number of records counted as valid
   invrecsread:	resw	1				; number of records that do not pass all checks
 
@@ -180,53 +190,231 @@ _start:
 	xor	rcx, rcx
 	xor	rax, rax
 	mov	rbx, [rel arg1p]
-	mov	rdi, [rel filename]
+	lea	rdi, [rel filename]
 	
 .filenamereadloop:
 	; read the argument filename one character at a time until we read
 	; a null character. Store each byte in memory and increment rcx
 	; or if we exceed 64 characters
 	mov	al, [rbx + rcx]
+	mov	byte [rdi + rcx], al
 	cmp	al, 0x00
 	jz	.filenamereaddone
-	mov	byte [rdi + rcx], al
 	inc	rcx
 	cmp	rcx, 0x40
 	je	.filenamereaddone
 	jmp	.filenamereadloop
 	
 .filenamereaddone:
+	; check if at least 5 characters were entered, error out if not
 	; store the length of the filename in memory
+	cmp	cl, 5
+	jb	.filenameerror
 	mov	byte [rel filenamelen], cl
+	xor	rax, rax
 	
-.loop:
+.fileextcheck:
+	; check the last four characters of the filename for ".hex"
+	; at this point, CL equals the length of the file name
+	; 
+	; 1) get the character at address of filename plus RCX
+	; 2) AND that character with 0xDF (0b11011111) to clear bit 5
+	;    which turns any lower-case letter upper case
+	; 3) check if the character is 'X'
+	; 4) if not, jump to invalid input
+	; 5) if so, decrement RCX and check again for 'E', 'H', and '.'
+	; 6) if all checks pass, fall to the next code segment
+	;
+	dec	rcx
+	mov	al, byte [rdi + rcx]
+	and	al, 0xDF
+	cmp	al, 0x58
+	jne	.filenameerror
+	dec	rcx
+	mov	al, byte [rdi + rcx]
+	and	al, 0xDF
+	cmp	al, 0x45
+	jne	.filenameerror
+	dec	rcx
+	mov	al, byte [rdi + rcx]
+	and	al, 0xDF
+	cmp	al, 0x48
+	jne	.filenameerror
+	dec	rcx
+	mov	al, byte [rdi + rcx]
+	cmp	al, 0x2E
+	jne	.filenameerror
+	
+.openthefilealready:
+	; if all of the checks so far have passed, open the file
+	; and display a message stating we are doing so
+	mov	rdx, op1len	
+	lea	rsi, [rel op1]
+	call	printtext
+	movzx	rdx, byte [rel filenamelen]
+	lea	rsi, [rel filename]
+	call	printtext
+	mov	rdx, 1
+	lea	rsi, [rel endl]
+	call	printtext
+	xor	rsi, rsi
+	lea	rdi, [rel filename]
+	xor	rdx, rdx
+	call	openfile
+	test	rax, rax
+	js	.fileerror
+	mov	dword [rel fd1], eax
 
+.readingsetup:
+	; clear registers and get ready to start pulling data from the file.
+	; RBX keeps track of the current line
+	; RCX is a input buffer pointer which wraps around at 255
+	; R8 keeps track of the number of valid records
+	; R9 keeps track of the number of invalid records
+	; R10 keeps track of the number of bytes in the file
+	xor	rbx, rbx
+	xor	rcx, rcx
+	xor	rdx, rdx
+	xor	r8, r8
+	xor	r9, r9
+	xor	r10, r10
+	
+.initialread:
+	; skip past any information in the HEX file before the first record. Normally
+	; this won't exist, but if someone like me decides to input some commentary
+	; ahead of the records, this will skip over it.
+	;
+	; flow: input a byte from the file and store it in the input buffer.
+	;       increment RCX. Does RCX = 0x100? If so, RCX = 0x00. Is the
+	;       byte 0x3A (':')? If so, fall through and read a record. If
+	;       not, loop around and try again.
+	mov	rdx, 0x01
+	mov	edi, [rel fd1]
+	lea	rsi, [rel inbuf]
+	call	readfile
+	test	rax, rax
+	js	.readerror
+	jz	.eoferror
+	; the following code is commented out - until we reach a byte that is ':',
+	; we don't need to store anything. Just read something in store it in
+	; inbuf[0]. Once we reach the beginning of a record, we care about what's
+	; written in there
+	;
+	; inc	rcx
+	; cmp	rcx, 0x100
+	; jb	.initialread2
+	; xor	rcx, rcx
+.initialread2:
+	mov	al, [rsi]
+	cmp	al, 0x3A
+	jne	.initialread
+
+.readingloop:
+	; the first record has been located. Now we input real data and start checking it
+	; for accuracy.	
+.readingbyteqty_1:
+	; the first two ASCII characters are the number of data bytes in the record
+	; we get them, convert them to a 1-byte value, and store that in memory. This will
+	; be used later when we count the data bytes in the record.
+	mov	rdx, 0x01
+	mov	edi, [rel fd1]
+	lea	rsi, [rel inbuf]
+	add	rsi, rcx
+	call	readfile
+	test	rax, rax
+	jnz	.readingbyteqty_2
+	js	.readerror
+	inc	r9
+.readingbyteqty_2:
+	xor	rax, rax
+	mov	al, byte [rsi]
+	; handle conversion of al from an ASCII character to a value from 0-15
+	; store it in memory at byteqty
+	; increment rcx and see if it is over 255. If so, make it 0 and return
+	; RSI to the beginning of the input buffer.
+	inc	rcx
+	inc	rsi
+	cmp	rcx, 0x100
+	jb	.readingbyteqty_3
+	xor	rcx, rcx
+	lea	rsi, [rel inbuf]
+.readingbyteqty_3:
+	call	readfile
+	test	rax, rax
+	jnz	.readingbyteqty_4
+	js	.readerror
+	inc	r9
+	jmp	; go to the part where we process an early EOF character
+.readingbyteqty_4:
+	xor	rax, rax
+	mov	al, byte [rsi]
+	; handle conversion of al from an ASCII character to a value from 0-15
+	; shift byteqty left four times and 
+	; increment rcx and see if it is over 255. If so, make it 0 and return
+	; RSI to the beginning of the input buffer.
+	inc	rcx
+	inc	rsi
+	cmp	rcx, 0x100
+	jb	.readingbyteqty_5
+	xor	rcx, rcx
+	lea	rsi, [rel inbuf]
+.readingbyteqty_5:
+	; clean up data accountability for this section.
+	add	invrecordsread, r9
+	
 .usageonly:
 	; with no input, the program displays a message
 	; explaining how to use the program
-	mov	rdx, usage1	
-	lea	rsi, [rel usage1len]
+	mov	rdx, usage1len	
+	lea	rsi, [rel usage1]
 	call	printtext
-	mov	rdx, usage2
-	lea	rsi, [rel usage2len]
+	mov	rdx, usage2len
+	lea	rsi, [rel usage2]
 	call	printtext
-	mov	rdx, usage3	
-	lea	rsi, [rel usage3len]
+	mov	rdx, usage3len	
+	lea	rsi, [rel usage3]
 	call	printtext
-	mov	rdx, usage4
-	lea	rsi, [rel usage4len]
+	mov	rdx, usage4len
+	lea	rsi, [rel usage4]
 	call	printtext
-	mov	rdx, usage5
-	lea	rsi, [rel usage5len]
+	mov	rdx, usage5len
+	lea	rsi, [rel usage5]
 	call	printtext
 	jmp	.exitprogram
 
 .inputerror:
-	mov	rdx, error5	
-	lea	rsi, [rel error5len]
+	mov	rdx, error5len
+	lea	rsi, [rel error5]
 	call	printtext
+	jmp	.exitprogram
+
+.filenameerror:
+	mov	rdx, error1len
+	lea	rsi, [rel error1]
+	call	printtext
+	jmp	.exitprogram
+
+.fileerror:
+	mov	rdx, error6len
+	lea	rsi, [rel error6]
+	call	printtext
+	jmp	.exitprogram
+	
+.eoferror:
+	mov	rdx, error7len
+	lea	rsi, [rel error7]
+	call	printtext
+	jmp	.closefile
+
+.readerror:
+	mov	rdx, error2len
+	lea	rsi, [rel error2]
+	call	printtext
+	jmp	.closefile
 
 .closefile:
+	mov	edi, [rel fd1]
+	call	closefile
 
 .exitprogram:
 	mov	eax, 60				; set up the function to exit
@@ -310,4 +498,16 @@ writefile:	mov	eax, 1				; rax = 1 sys_write
 ;--------------------------------------------------------------------
 closefile:	mov	rax, 3				; rax = 3 sys_close
 		syscall
+		ret
+		
+;--------------------------------------------------------------------
+; Subroutine: texttohex
+; 
+; Converts two ASCII characters into a hexadecimal qty 
+; 
+; Inputs: AX - high:low characters that will become a single byte quantity
+; Destroys: 
+; Outputs:
+;--------------------------------------------------------------------	
+texttohex:
 		ret
