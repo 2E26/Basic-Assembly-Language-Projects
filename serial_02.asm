@@ -128,7 +128,8 @@ section .bss
   byteqty:	resb	1				; number of bytes in the current record
   rectype:	resb	1				; used to record the type of record being read
   temp1:	resb	1				; temporary placeholder for one byte
-  chksumtotal:	resb	1				; running total for checksum 
+  chksumtotal:	resb	1				; running total for checksum
+  is_valid:	resb	1				; a flag that allows certain other functions to declare the file invalid
 
 section .text
 
@@ -321,11 +322,16 @@ _start:
 	; 6) read the record's checksum and see if it matches
 	mov	byte [rel chksumtotal], 0x00
 .recordloop_size:
+	; read the quantity of bytes in the current line
+	; this number gets added into the checksum
 	call	ReadIHEXByte
 	jc	.recordloop_error
 	mov	byte [rel byteqty], al
 	add	byte [rel chksumtotal], al
 .recordloop_address:
+	; read the address bytes (two of them) and
+	; store them in little-endian
+	; this number gets added into the checksum
 	call	ReadIHEXByte
 	jc	.recordloop_error
 	mov	byte [rel address + 1], al
@@ -335,17 +341,30 @@ _start:
 	mov	byte [rel address], al
 	add	byte [rel chksumtotal], al
 .recordloop_type:
+	; read the type byte. If it's 1, skip reading
+	; data bytes and go to the checksum. Otherwise,
+	; go to reading bytes. We are going to treat
+	; non-zero data records as valid for now. I won't
+	; be using any of them.
+	; this number gets added into the checksum.
 	call	ReadIHEXByte
 	jc	.recordloop_error
 	mov	byte [rel rectype], al
 	add	byte [rel chksumtotal], al
 	cmp	al, 0x01
-	je	.recordloop_eof
+	je	.recordloop_data_checksum
 .recordloop_data_init:
+	; set R12 as a counter equal to the quantity used
+	; in the record size step. If it's zero, go to
+	; the checksum step
 	movzx	r12, byte [rel byteqty]
 	test	r12, r12
 	jz	.recordloop_data_checksum
 .recordloop_data_read:
+	; read one of the data bytes and add into the
+	; checksum total. Increment R10 to account for the
+	; byte and decrement R12. If R12 is not zero,
+	; do it all again.
 	call	ReadIHEXByte
 	jc	.recordloop_error
 	add	byte [rel chksumtotal], al
@@ -353,20 +372,102 @@ _start:
 	dec	r12
 	jnz	.recordloop_data_read
 .recordloop_data_checksum:
+	; checksum total is a single byte in memory. All
+	; additions to this will result in an overflow
+	; so the low byte of the sum will be contained
+	; by the time we reach this point.
+	; 
+	; if we read the checksum byte and add it to this
+	; total, the result will be zero for a valid
+	; record. If it is not, count a bad record.
 	call	ReadIHEXByte
 	jc	.recordloop_error
 	add	byte [rel chksumtotal], al
 	jz	.recordloop_valid
 	jmp	.recordloop_error
-.recordloop_eof:
-	; when we encounter the EOF record
 .recordloop_error:
 	; error handling - error code contained in AL
+	; add one to the counter for invalid records
+	; and go to the next one
 	inc	r9
-	jmp	.initialread
+	jmp	.recordloop_nextline
 .recordloop_valid:
+	; if everything worked out, add one to the
+	; valid records counter. Check if the record
+	; type is 1 - if so we go to the EOF handler.
+	; Otherwise fall through to the next line
+	; handler. 
 	inc	r8
-	jmp	.initialread
+	mov	al, [rel rectype]
+	cmp	al, 0x01
+	je	.recordloop_eof
+.recordloop_nextline:
+	; input one character. It should be 0x0A or 0x0D.
+	; reading 0x0A jumps directly to the third step, while
+	; 0x0D reads the next byte, expecting it to be 0x0A.
+	mov	rdx, 0x01
+	mov	edi, [rel fd1]
+	lea	rsi, [rel inbuf]
+	movzx	rcx, byte [rel inputptr]
+	add	rsi, rcx
+	call	readfile
+	test	rax, rax
+	js	.readerror
+	jz	.eoferror
+	mov	al, [rsi]
+	cmp	al, 0x0A
+	je	.recordloop_nextline3
+	cmp	al, 0x0D
+	je	.recordloop_nextline2
+	inc	byte [rel is_valid]
+	jmp	.recordloop_nextline
+.recordloop_nextline2:
+	call	readfile
+	test	rax, rax
+	js	.readerror
+	jz	.eoferror
+	mov	al, [rsi]
+	cmp	al, 0x0A
+	je	.recordloop_nextline3
+	inc	byte [rel is_valid]
+	jmp	.recordloop_nextline2
+.recordloop_nextline3:
+	call	readfile
+	test	rax, rax
+	js	.readerror
+	jz	.eoferror
+	mov	al, [rsi]
+	cmp	al, 0x3A
+	je	.recordloop_main
+	inc	byte [rel is_valid]
+	jmp	.recordloop_nextline3
+.recordloop_eof:
+	test	r9, r9
+	jz	.printresults
+	inc	byte [rel is_valid]
+	jmp	.printresults
+	
+.printresults:
+	mov	al, [rel is_valid}
+	jnz	.printfailure
+	mov	rdx, success1	
+	lea	rsi, [rel success1len]
+	call	printtext
+	mov	rdx, success2	
+	lea	rsi, [rel success2len]
+	call	printtext
+	; figure out how to print the decimal value in R8
+	;
+	; figure out how to print a CR / LF
+	;
+	mov	rdx, success4	
+	lea	rsi, [rel success4len]
+	call	printtext
+	; figure out how to print the decimal value in R10
+	;
+	; figure out how to print a CR / LF
+	;
+	jmp	closefile	
 	
 .usageonly:
 	; with no input, the program displays a message
@@ -389,30 +490,35 @@ _start:
 	jmp	.exitprogram
 
 .inputerror:
+	inc	byte [rel is_valid]
 	mov	rdx, error5len
 	lea	rsi, [rel error5]
 	call	printtext
 	jmp	.exitprogram
 
 .filenameerror:
+	inc	byte [rel is_valid]
 	mov	rdx, error1len
 	lea	rsi, [rel error1]
 	call	printtext
 	jmp	.exitprogram
 
 .fileerror:
+	inc	byte [rel is_valid]
 	mov	rdx, error6len
 	lea	rsi, [rel error6]
 	call	printtext
 	jmp	.exitprogram
 	
 .eoferror:
+	inc	byte [rel is_valid]
 	mov	rdx, error7len
 	lea	rsi, [rel error7]
 	call	printtext
 	jmp	.closefile
 
 .readerror:
+	inc	byte [rel is_valid]
 	mov	rdx, error2len
 	lea	rsi, [rel error2]
 	call	printtext
