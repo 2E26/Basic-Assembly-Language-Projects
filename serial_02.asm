@@ -126,9 +126,7 @@ section .bss
   outbuf:	resb	256				; output buffer to be filled up with data
   outputptr:	resb	1				; used to track position in the output buffer
   byteqty:	resb	1				; number of bytes in the current quantity
-  bytesread:	resw	1				; number of data bytes that were read from the input file
-  recordsread:	resw	1				; number of records counted as valid
-  invrecsread:	resw	1				; number of records that do not pass all checks
+  temp1:	resb	1				; temporary placeholder for one byte
 
 section .text
 
@@ -309,58 +307,7 @@ _start:
 	cmp	al, 0x3A
 	jne	.initialread
 
-.readingloop:
-	; the first record has been located. Now we input real data and start checking it
-	; for accuracy.	
-.readingbyteqty_1:
-	; the first two ASCII characters are the number of data bytes in the record
-	; we get them, convert them to a 1-byte value, and store that in memory. This will
-	; be used later when we count the data bytes in the record.
-	mov	rdx, 0x01
-	mov	edi, [rel fd1]
-	lea	rsi, [rel inbuf]
-	add	rsi, rcx
-	call	readfile
-	test	rax, rax
-	jnz	.readingbyteqty_2
-	js	.readerror
-	inc	r9
-.readingbyteqty_2:
-	xor	rax, rax
-	mov	al, byte [rsi]
-	; handle conversion of al from an ASCII character to a value from 0-15
-	; store it in memory at byteqty
-	; increment rcx and see if it is over 255. If so, make it 0 and return
-	; RSI to the beginning of the input buffer.
-	inc	rcx
-	inc	rsi
-	cmp	rcx, 0x100
-	jb	.readingbyteqty_3
-	xor	rcx, rcx
-	lea	rsi, [rel inbuf]
-.readingbyteqty_3:
-	call	readfile
-	test	rax, rax
-	jnz	.readingbyteqty_4
-	js	.readerror
-	inc	r9
-	jmp	; go to the part where we process an early EOF character
-.readingbyteqty_4:
-	xor	rax, rax
-	mov	al, byte [rsi]
-	; handle conversion of al from an ASCII character to a value from 0-15
-	; shift byteqty left four times and 
-	; increment rcx and see if it is over 255. If so, make it 0 and return
-	; RSI to the beginning of the input buffer.
-	inc	rcx
-	inc	rsi
-	cmp	rcx, 0x100
-	jb	.readingbyteqty_5
-	xor	rcx, rcx
-	lea	rsi, [rel inbuf]
-.readingbyteqty_5:
-	; clean up data accountability for this section.
-	add	invrecordsread, r9
+
 	
 .usageonly:
 	; with no input, the program displays a message
@@ -501,13 +448,107 @@ closefile:	mov	rax, 3				; rax = 3 sys_close
 		ret
 		
 ;--------------------------------------------------------------------
-; Subroutine: texttohex
+; Subroutine: ReadIHEXByte
 ; 
-; Converts two ASCII characters into a hexadecimal qty 
+; Retrieve two ASCII characters from a HEX file and place the equivalent
+; value in memory.  
 ; 
-; Inputs: AX - high:low characters that will become a single byte quantity
-; Destroys: 
-; Outputs:
+; Inputs: RSI - address of input buffer (plus offset stored in RCX)
+; Destroys: RAX
+; Outputs: AL - the value of the two hexadecimal ASCII characters
+;	   Carry - set if operation failed
 ;--------------------------------------------------------------------	
-texttohex:
+ReadIHEXByte:
+		; 1) read a byte from the file
+		; 2) error out if failed or EOF
+		; 3) clear rax and load the read byte into al
+		; 4) convert al into the character's value
+		; 5) shift left four times and store in memory
+		; 6) read a second byte
+		; 7) error out if failed or EOF
+		; 8) clear rax and load the read byte into al
+		; 9) convert al into the character's value
+		; A) OR al with the byte stored in temp1
+		;
+		; fail conditions:
+		; 1} the read operation was a failure or a non-HEX byte was read
+		; 2} EOF encountered where it shouldn't have
+		mov	rdx, 1
+		mov	edi, [rel fd1]
+		call	readfile
+		test	rax, rax
+		js	.ReadIHEXByte_fail_1
+		jz	.ReadIHEXByte_fail_2
+		xor	rax, rax
+		mov	al, byte [rsi]
+		call	ASCIItoHex
+		jc	.ReadIHEXByte_fail_1
+		shl	al, 4
+		mov	[rel temp1], al
+		inc	rcx
+		call	CounterOverflowCheck
+		add	rsi, rcx
+		call	readfile
+		; routine under construction
+.ReadIHEXByte_fail_1
+		; needs to be worked
+.ReadIHEXByte_fail_2
+		; needs to be worked		
+		ret
+		
+;--------------------------------------------------------------------
+; Subroutine: ASCIItoHEX
+; 
+; Converts an ASCII value hexadecimal character in AL to its respective
+; numerical value, returns it in the lower nibble of AL   
+; 
+; Inputs: AL - hexadecimal character used to 
+; Destroys: AL
+; Outputs: AL - value of hexadecimal character
+; 	   Carry - set if read failed
+;--------------------------------------------------------------------
+ASCIItoHEX:
+		; check if the character is between '0' and '9'. If so,
+		; handle a number character. If it is above, AND it with
+		; a bit mask to force upper case and check if it is in
+		; range of 'A' through 'F'. If so, handle a letter.
+		;
+		; In all other cases, indicate a failure by setting the
+		; carry flag.
+		cmp	al, 0x30
+		jb	.ASCIItoHEX_fail
+		cmp	al, 0x39
+		jbe	.ASCIItoHEX_number
+		and	al, 0xDF
+		cmp	al, 0x41
+		jb	.ASCIItoHEX_fail
+		cmp	al, 0x46
+		ja	.ASCIItoHEX_fail
+		sub	al, 0x37
+		clc
+		ret
+.ASCIItoHEX_number:
+		sub	al, 0x30
+		clc
+		ret
+.ASCIItoHEX_fail:
+		stc
+		ret
+
+;--------------------------------------------------------------------
+; Subroutine: CounterOverflowCheck
+; 
+; Checks if RCX equals 256 after an increment, reverts it to zero
+; if so. Otherwise does nothing.
+; 
+; Inputs: RCX - used as an input buffer counter 
+; Destroys:
+; Outputs: 
+;--------------------------------------------------------------------
+CounterOverflowCheck:
+		cmp	rcx, 0x100
+		jb	.noneed
+		xor	rcx, rcx
+		lea	rsi, [rel inbuf]
+.noneed:
 		ret
