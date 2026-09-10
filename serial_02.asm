@@ -125,8 +125,10 @@ section .bss
   inputptr:	resb	1				; used to track position in the input buffer
   outbuf:	resb	256				; output buffer to be filled up with data
   outputptr:	resb	1				; used to track position in the output buffer
-  byteqty:	resb	1				; number of bytes in the current quantity
+  byteqty:	resb	1				; number of bytes in the current record
+  rectype:	resb	1				; used to record the type of record being read
   temp1:	resb	1				; temporary placeholder for one byte
+  chksumtotal:	resb	1				; running total for checksum 
 
 section .text
 
@@ -143,9 +145,9 @@ _start:
 	mov	dword [rel fd1], eax
 	mov	byte [rel inputptr], al
 	mov	byte [rel outputptr], al
-	mov	word [rel bytesread], ax
-	mov	word [rel recordsread], ax
-	mov	word [rel invrecsread], ax
+	mov	byte [rel byteqty], al
+	mov	byte [rel temp1], al
+	mov	byte [rel chksumtotal], al
 	
 .memclear:
 	; batch clear the memory buffers before reading/writing
@@ -270,12 +272,14 @@ _start:
 	; R8 keeps track of the number of valid records
 	; R9 keeps track of the number of invalid records
 	; R10 keeps track of the number of bytes in the file
+	; R12 is a counter to keep track of reading bytes in the data section
 	xor	rbx, rbx
 	xor	rcx, rcx
 	xor	rdx, rdx
 	xor	r8, r8
 	xor	r9, r9
 	xor	r10, r10
+	xor	r12, r12
 	
 .initialread:
 	; skip past any information in the HEX file before the first record. Normally
@@ -307,7 +311,62 @@ _start:
 	cmp	al, 0x3A
 	jne	.initialread
 
-
+.recordloop_main:
+	; this loop handles the entirety of one record.
+	; 1) read the size of the record in bytes
+	; 2) read the address of the start of the record
+	; 3) read the record type
+	; 4) read the number of data bytes in the record, confirm they match the size
+	; 5) calculate the checksum
+	; 6) read the record's checksum and see if it matches
+	mov	byte [rel chksumtotal], 0x00
+.recordloop_size:
+	call	ReadIHEXByte
+	jc	.recordloop_error
+	mov	byte [rel byteqty], al
+	add	byte [rel chksumtotal], al
+.recordloop_address:
+	call	ReadIHEXByte
+	jc	.recordloop_error
+	mov	byte [rel address + 1], al
+	add	byte [rel chksumtotal], al
+	call	ReadIHEXByte
+	jc	.recordloop_error
+	mov	byte [rel address], al
+	add	byte [rel chksumtotal], al
+.recordloop_type:
+	call	ReadIHEXByte
+	jc	.recordloop_error
+	mov	byte [rel rectype], al
+	add	byte [rel chksumtotal], al
+	cmp	al, 0x01
+	je	.recordloop_eof
+.recordloop_data_init:
+	movzx	r12, byte [rel byteqty]
+	test	r12, r12
+	jz	.recordloop_data_checksum
+.recordloop_data_read:
+	call	ReadIHEXByte
+	jc	.recordloop_error
+	add	byte [rel chksumtotal], al
+	inc	r10
+	dec	r12
+	jnz	.recordloop_data_read
+.recordloop_data_checksum:
+	call	ReadIHEXByte
+	jc	.recordloop_error
+	add	byte [rel chksumtotal], al
+	jz	.recordloop_valid
+	jmp	.recordloop_error
+.recordloop_eof:
+	; when we encounter the EOF record
+.recordloop_error:
+	; error handling - error code contained in AL
+	inc	r9
+	jmp	.initialread
+.recordloop_valid:
+	inc	r8
+	jmp	.initialread
 	
 .usageonly:
 	; with no input, the program displays a message
@@ -453,7 +512,7 @@ closefile:	mov	rax, 3				; rax = 3 sys_close
 ; Retrieve two ASCII characters from a HEX file and place the equivalent
 ; value in memory.  
 ; 
-; Inputs: RSI - address of input buffer (plus offset stored in RCX)
+; Inputs: none
 ; Destroys: RAX
 ; Outputs: AL - the value of the two hexadecimal ASCII characters
 ;	   Carry - set if operation failed
@@ -471,29 +530,46 @@ ReadIHEXByte:
 		; A) OR al with the byte stored in temp1
 		;
 		; fail conditions:
-		; 1} the read operation was a failure or a non-HEX byte was read
-		; 2} EOF encountered where it shouldn't have
+		; 1} (AL = FF) the read operation was a failure or a non-HEX byte was read
+		; 2} (AL = FE) EOF encountered where it shouldn't have
 		mov	rdx, 1
 		mov	edi, [rel fd1]
+		lea	rsi, [rel inbuf]
+		movzx	rcx, byte [rel inputptr]
+		add	rsi, rcx
 		call	readfile
 		test	rax, rax
 		js	.ReadIHEXByte_fail_1
 		jz	.ReadIHEXByte_fail_2
 		xor	rax, rax
 		mov	al, byte [rsi]
-		call	ASCIItoHex
+		call	ASCIItoHEX
 		jc	.ReadIHEXByte_fail_1
 		shl	al, 4
 		mov	[rel temp1], al
-		inc	rcx
-		call	CounterOverflowCheck
+		inc	byte [rel inputptr]
+		movzx	rcx, byte [rel inputptr]
+		lea	rsi, [rel inbuf]
 		add	rsi, rcx
 		call	readfile
-		; routine under construction
+		test	rax, rax
+		js	.ReadIHEXByte_fail_1
+		jz	.ReadIHEXByte_fail_2
+		xor	rax, rax
+		mov	al, byte [rsi]
+		call	ASCIItoHEX
+		jc	.ReadIHEXByte_fail_1
+		or	al, [rel temp1]
+		inc	byte [rel inputptr]
+		clc
+		ret
 .ReadIHEXByte_fail_1
-		; needs to be worked
+		mov	al, 0xFF
+		stc
+		ret
 .ReadIHEXByte_fail_2
-		; needs to be worked		
+		mov	al, 0xFE
+		stc	
 		ret
 		
 ;--------------------------------------------------------------------
@@ -533,22 +609,4 @@ ASCIItoHEX:
 		ret
 .ASCIItoHEX_fail:
 		stc
-		ret
-
-;--------------------------------------------------------------------
-; Subroutine: CounterOverflowCheck
-; 
-; Checks if RCX equals 256 after an increment, reverts it to zero
-; if so. Otherwise does nothing.
-; 
-; Inputs: RCX - used as an input buffer counter 
-; Destroys:
-; Outputs: 
-;--------------------------------------------------------------------
-CounterOverflowCheck:
-		cmp	rcx, 0x100
-		jb	.noneed
-		xor	rcx, rcx
-		lea	rsi, [rel inbuf]
-.noneed:
 		ret
