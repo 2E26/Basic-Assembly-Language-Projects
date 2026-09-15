@@ -448,43 +448,49 @@ _start:
 	jmp	.printresults
 	
 .printresults:
-	mov	al, [rel is_valid}
+	mov	al, [rel is_valid]
 	jnz	.printfailure
-	mov	rdx, success1	
-	lea	rsi, [rel success1len]
+	mov	rdx, success1len	
+	lea	rsi, [rel success1]
 	call	printtext
-	mov	rdx, success2	
-	lea	rsi, [rel success2len]
+	mov	rdx, success2len	
+	lea	rsi, [rel success2]
 	call	printtext
-	; figure out how to print the decimal value in R8
-	;
-	; figure out how to print a CR / LF
-	;
-	mov	rdx, success4	
-	lea	rsi, [rel success4len]
+	mov	r8, rax
+	call	printdecimal
+	mov	rdx, 1
+	lea	rsi, [rel endl]
 	call	printtext
-	; figure out how to print the decimal value in R10
-	;
-	; figure out how to print a CR / LF
-	;
+	mov	rdx, success4len	
+	lea	rsi, [rel success4]
+	call	printtext
+	mov	r9, rax
+	call	printdecimal
+	mov	rdx, 1
+	lea	rsi, [rel endl]
+	call	printtext
+	jmp	closefile
+	
+.printfailure:
+	; need to have an error message here if the file is not a valid HEX file
 	jmp	closefile	
 	
 .usageonly:
 	; with no input, the program displays a message
 	; explaining how to use the program
-	mov	rdx, usage1len	
+	mov	rdx, u1len	
 	lea	rsi, [rel usage1]
 	call	printtext
-	mov	rdx, usage2len
+	mov	rdx, u2len
 	lea	rsi, [rel usage2]
 	call	printtext
-	mov	rdx, usage3len	
+	mov	rdx, u3len	
 	lea	rsi, [rel usage3]
 	call	printtext
-	mov	rdx, usage4len
+	mov	rdx, u4len
 	lea	rsi, [rel usage4]
 	call	printtext
-	mov	rdx, usage5len
+	mov	rdx, u5len
 	lea	rsi, [rel usage5]
 	call	printtext
 	jmp	.exitprogram
@@ -548,6 +554,127 @@ printtext:
   		mov	edi, 1
   		syscall
   		ret
+ 
+;--------------------------------------------------------------------
+; Subroutine: print decimal
+; 
+; Prints an ASCII representation of a number loaded in AX. Limited
+; to values 0 - 65,535.
+;
+; BH - counts how many characters are printed
+; BL - counts what character to print
+; DX - contains the subtraction value
+; 
+; Inputs: AX - binary value we want to print to screen
+; Destroys: AX, BX, DX, Temp1
+; Outputs: Printed characters to screen
+;--------------------------------------------------------------------
+printdecimal:
+		; initialize registers
+		; make DX = 10,000 for first go
+		xor	rbx, rbx
+		xor	rdx, rdx
+		mov	dx, 0x2710
+.printdecimal_loop:
+		; check if there's anything in the current numerical place
+		; by subtracting. If the carry flag sets, we have run out
+		; of value in that decimal place. Go to next segment.
+		sub	ax, dx
+		jc	.printdecimal_next
+		inc	bl
+		jmp	.printdecimal_loop
+.printdecimal_next:
+		; restore AX so we can do more math on it following an
+		; overflow. See if BL incremented at all. If so, make
+		; an ASCII character out of it and print it. If BL
+		; is zero, check if we have printed any characters
+		; previously. If we have, print a place holder zero.
+		; If we have not, then skip it and go to the next
+		; numerical place.
+		add	ax, dx
+		test	bl, bl
+		jz	.printdecimal_zerohandler
+		add	bl, 0x30
+		mov	[rel temp1], bl
+		lea	rsi, [rel temp1]
+		push	rdx
+		push	rax
+		mov	rdx, 0x01
+		call	printtext
+		pop	rax
+		pop	rdx
+		inc	bh
+		jmp	.printdecimal_check10K
+.printdecimal_zerohandler:
+		; we get here if zero was the number in the current
+		; numerical place. Decide whether or not to print
+		; a placeholder zero.
+		test	bh, bh
+		jz	.printdecimal_check10K
+		mov	bl, 0x30
+		mov	[rel temp1], bl
+		lea	rsi, [rel temp1]
+		push	rdx
+		push	rax
+		mov	rdx, 0x01
+		call	printtext
+		pop	rax
+		pop	rdx
+		inc	bh
+.printdecimal_check10K:
+		; if DX = 10,000, make DX = 1,000
+		; also clear BL for the next loop
+		; around.
+		xor	bl, bl
+		cmp	dx, 0x2710
+		jne	.printdecimal_check1K
+		mov	dx, 0x3E8
+		jmp	.printdecimal_loop
+.printdecimal_check1K:
+		; if DX = 1,000, make DX = 100
+		cmp	dx, 0x3E8
+		jne	.printdecimal_check100
+		mov	dx, 0x64
+		jmp	.printdecimal_loop
+.printdecimal_check100:
+		; if DX = 100, make DX = 10
+		cmp	dx, 0x64
+		jne	.printdecimal_check10
+		mov	dx, 0x0A
+		jmp	.printdecimal_loop
+.printdecimal_check10:
+		; if DX = 10, make DX = 1
+		cmp	dx, 0x0A
+		jne	.printdecimal_end
+		mov	dx, 0x01
+		jmp	.printdecimal_loop
+.printdecimal_end:
+		; make sure DX = 1. Check if any
+		; characters were printed. If there
+		; were not, print a single zero. If
+		; there were, then just exit routine.
+		cmp	dx, 0x01
+		jne	.printdecimal_error
+		test	bh, bh
+		jnz	.printdecimal_goback
+		mov	bl, 0x30
+		mov	[rel temp1], bl
+		lea	rsi, [rel temp1]
+		push	rdx
+		push	rax
+		mov	rdx, 0x01
+		call	printtext
+		pop	rax
+		pop	rdx
+.printdecimal_goback:
+		; just go back to where we came from
+  		ret
+.printdecimal_error:
+		; should never happen, but if DX != 1
+		; after the whole process, some code
+		; to handle it would go here. Probably
+		; doesn't need to be any.
+		ret
 
 ;--------------------------------------------------------------------
 ; Subroutine: openfile
@@ -669,11 +796,11 @@ ReadIHEXByte:
 		inc	byte [rel inputptr]
 		clc
 		ret
-.ReadIHEXByte_fail_1
+.ReadIHEXByte_fail_1:
 		mov	al, 0xFF
 		stc
 		ret
-.ReadIHEXByte_fail_2
+.ReadIHEXByte_fail_2:
 		mov	al, 0xFE
 		stc	
 		ret
