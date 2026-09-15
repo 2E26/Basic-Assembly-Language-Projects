@@ -456,7 +456,7 @@ _start:
 	mov	rdx, success2len	
 	lea	rsi, [rel success2]
 	call	printtext
-	mov	r8, rax
+	mov	ax, r8w
 	call	printdecimal
 	mov	rdx, 1
 	lea	rsi, [rel endl]
@@ -464,16 +464,16 @@ _start:
 	mov	rdx, success4len	
 	lea	rsi, [rel success4]
 	call	printtext
-	mov	r9, rax
+	mov	ax, r10w
 	call	printdecimal
 	mov	rdx, 1
 	lea	rsi, [rel endl]
 	call	printtext
-	jmp	closefile
+	jmp	.closefile
 	
 .printfailure:
 	; need to have an error message here if the file is not a valid HEX file
-	jmp	closefile	
+	jmp	.closefile	
 	
 .usageonly:
 	; with no input, the program displays a message
@@ -531,6 +531,7 @@ _start:
 	jmp	.closefile
 
 .closefile:
+	xor	rdi, rdi
 	mov	edi, [rel fd1]
 	call	closefile
 
