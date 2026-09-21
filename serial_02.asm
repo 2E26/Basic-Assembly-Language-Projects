@@ -448,8 +448,8 @@ _start:
 	jmp	.printresults
 	
 .printresults:
-	mov	al, [rel is_valid]
-	jnz	.printfailure
+	cmp	byte [rel is_valid], 0
+	jne	.printfailure
 	mov	rdx, success1len	
 	lea	rsi, [rel success1]
 	call	printtext
@@ -472,7 +472,36 @@ _start:
 	jmp	.closefile
 	
 .printfailure:
-	; need to have an error message here if the file is not a valid HEX file
+	mov	rdx, error4len
+	lea	rsi, [rel error4]
+	call	printtext
+	mov	rdx, 1
+	lea	rsi, [rel endl]
+	call	printtext
+	mov	rdx, success2len
+	lea	rsi, [rel success2]
+	call	printtext
+	mov	ax, r8w
+	call	printdecimal
+	mov	rdx, 1
+	lea	rsi, [rel endl]
+	call	printtext
+	mov	rdx, success3len
+	lea	rsi, [rel success3]
+	call	printtext
+	mov	ax, r9w
+	call	printdecimal
+	mov	rdx, 1
+	lea	rsi, [rel endl]
+	call	printtext
+	mov	rdx, success4len
+	lea	rsi, [rel success4]
+	call	printtext
+	mov	ax, r10w
+	call	printdecimal
+	mov	rdx, 1
+	lea	rsi, [rel endl]
+	call	printtext
 	jmp	.closefile	
 	
 .usageonly:
