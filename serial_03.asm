@@ -28,9 +28,22 @@
 ;   c - read the filename entered and ensure the last four characters are ".HEX"
 ;   d - open the file, error out if this fails
 ;   e - read through the file, ensuring it has data records and fits the general
-;       
+;       requirements of a HEX file
+;   f - error out if the file is invalid. Otherwise, pass on to the next step.
 ;
+; 2) refresh the file counter (lseek) and establish serial connection with the PIC
 ;
+; 3) write the program to EEPROM
+;   a - find the first data record
+;   b - read the amount of bytes and the address. Read and ignore the type
+;   c - set the PIC programming address to the record's beginning address
+;   d - read the data bytes in the record and store them in a 64 byte buffer
+;   e - if necessary, read another record until 64 bytes are in the buffer
+;   f - send 64 bytes into the PIC's memory page for performing a page write
+;   g - direct the PIC to perform a block write into ROM with the sent data
+;   h - if more data exists in the file, keep reading and writing until we
+;       reach the EOF record or pick up an EOF character.
+;   i - print a display message stating that we wrote N bytes to ROM
 ;
 ;--------------------------------------------------------------------------------------------------
 
@@ -40,15 +53,15 @@ section .data
 
   ; text to display on the screen.
   ; first section is usage.
-  usage1:	db	"Format: serial_02 <inputfile.hex>", 0x0A, 0x0A
+  usage1:	db	"Format: serial_03 -s NN <inputfile.hex>", 0x0A, 0x0A
   u1len:	equ	$ - usage1
-  usage2:	db	"Checks a HEX file to ensure it contains valid formatting", 0x0A
+  usage2:	db	"Validates a HEX file and writes it to ROM via a PIC16F877A", 0x0A
   u2len:	equ	$ - usage2
-  usage3:	db	"and data. This code will be used later to screen software", 0x0A
+  usage3:	db	"-s NN: enter a two-digit ROM size in kilobytes.", 0x0A
   u3len:	equ	$ - usage3
-  usage4:	db	"before entering it into ROM for a 6502 computer.", 0x0A
+  usage4:	db	"inputfile.hex - an Intel HEX file containing code for loading into the ROM", 0x0A
   u4len:	equ	$ - usage4
-  usage5:	db	"Only *.hex files are considered valid", 0x0A
+  usage5:	db	"This is an accessory program to PIC16 Serial_02.asm", 0x0A
   u5len:	equ	$ - usage5
   
   op1:		db	"Opening file name: "
@@ -78,7 +91,7 @@ section .data
   success4:	db	"Number of data bytes read: "
   success4len:	equ	$ - success4
   
-  intro1:	db	"Hex Validation Software", 0x0A
+  intro1:	db	"EEPROM Programmer Handler Software", 0x0A
   intro1len:	equ	$ - intro1
   intro2:	db	"By Jonathan Edwards", 0x0A
   intro2len:	equ	$ - intro2
@@ -87,24 +100,37 @@ section .data
   eoflinelen:	equ	$ - eofline
   
   endl:		db	0x0A
+  
+  SerPortName:	db	"/dev/ttyUSB0", 0
+  SerPortSize:	equ	$ - SerPortName
+  SPErr01:	db	"Serial port open fail. Exiting.", 0
+  SPErr01Len:	equ	$ - SPErr01
+  SPErr02:	db	"Serial write fail. Exiting.", 0
+  SPErr02Len:	equ	$ - SPErr02
+  SPErr03:	db	"Serial read fail. Exiting.", 0
+  SPErr03Len:	equ	$ - SPErr03
 
 section .bss
 
   argc:		resq	1				; number of arguments on the command line
-  arg1p:	resq	1				; pointer to filename
+  arg1p:	resq	1				; pointer to -s flag
+  arg2p:	resq	1				; pointer to kilobyte size entry
+  arg3p:	resq	1				; pointer to input filename
   filename:	resb	64				; memory to store filename
   filenamelen:	resb	1				; memory to store filename length
   address:	resw	1				; memory address to write to (16-bit for 6502 type addressing)
-  fd1:		resd	1				; to store the first file descriptor  
+  fd1:		resd	1				; to store the first file descriptor (data file)
+  fd2:		resd	1				; to store second file descriptor (serial port)  
   inbuf:	resb	256				; empty bytes to be used for input data
   inputptr:	resb	1				; used to track position in the input buffer
-  outbuf:	resb	256				; output buffer to be filled up with data
+  outbuf:	resb	64				; output buffer to be filled up with data
   outputptr:	resb	1				; used to track position in the output buffer
   byteqty:	resb	1				; number of bytes in the current record
   rectype:	resb	1				; used to record the type of record being read
   temp1:	resb	1				; temporary placeholder for one byte
   chksumtotal:	resb	1				; running total for checksum
   is_valid:	resb	1				; a flag that allows certain other functions to declare the file invalid
+  rom_size	resb	1				; used to store the ROM size
 
 section .text
 
@@ -124,6 +150,7 @@ _start:
 	mov	byte [rel byteqty], al
 	mov	byte [rel temp1], al
 	mov	byte [rel chksumtotal], al
+	mov	byte [rel rom_size], al
 	
 .memclear:
 	; batch clear the memory buffers before reading/writing
@@ -132,7 +159,7 @@ _start:
 	mov	rcx, 0x100
 	lea	rdi, [rel inbuf]
 	rep	stosb
-	mov	rcx, 0x100
+	mov	rcx, 0x40
 	lea	rdi, [rel outbuf]
 	rep	stosb
 	mov	rcx, 0x40
@@ -153,19 +180,87 @@ _start:
 	; store it in memory
 	mov	rbx, [rsp]
 	mov	qword [rel argc], rbx
-	cmp	rbx, 2
+	cmp	rbx, 4
 	ja	.inputerror
 	jb	.usageonly
-	; save the location of the argument in memory
+	; save the location of the arguments in memory
+	; arg1p - "-s" flag
+	; arg2p - one or two ASCII characters to dictate the size of the ROM
+	; arg3p - input file name
 	mov	rsi, [rsp + 16]
 	mov	qword [rel arg1p], rsi
+	mov	rsi, [rsp + 24]
+	mov	qword [rel arg2p], rsi
+	mov	rsi, [rsp + 32]
+	mov	qword [rel arg3p], rsi
+	
+.sizeflagvalidate:
+	; part of the required input is a "size flag", which is "-s" or "-S"
+	; immediately following the command. Failure to enter to command
+	; correctly will result in an input error.
+	xor	rax, rax
+	mov	rbx, [rel arg1p]
+	cmp	byte [rbx], 0x2D
+	jne	.inputerror
+	mov	al, [rbx + 1]
+	and	al, 0xDF
+	cmp	al, 0x53
+	jne	.inputerror
+	cmp	byte [rbx + 2], 0x00
+	jne	.inputerror
+	
+.sizeread:
+	; this code reads the entered size of ROM.
+	; 
+	; 1) read a byte at the second arg pointer
+	; 2) subtract 48
+	; 3) if the result is not 0-9, error out
+	; 4) store the result in memory
+	; 5) get the next chacter
+	; 6) if it is a null char, jump to the next part
+	; 7) otherwise, see if the third character is null
+	; 8) if the second and third character aren't null, error out
+	; 9) subtract 48 from the read byte
+	; 10) if the result isn't 0-9, error out
+	; 11) store the result in BL
+	; 12) retrieve the stored memory byte into EAX, extend out with zeroes
+	; 13) multiply EAX by 10 and store in EAX
+	; 14) add the value stored in BL
+	; 15) check if the resultant value is over 64 (error out if so)
+	; 16) store the result in the memory location otherwise
+	xor	rax, rax
+	mov	rbx, [rel arg2p]
+	mov	al, [rbx]
+	sub	al, 0x30
+	cmp	al, 0x09
+	ja	.inputerror
+	mov	[rel rom_size], al
+	mov	al, [rbx + 1]
+	test	al, al
+	jz	.filenamereadsetup
+	cmp	byte [rbx + 2], 0x00
+	jne	.inputerror
+	sub	al, 0x30
+	cmp	al, 0x09
+	ja	.inputerror
+	mov	bl, al
+	movzx	eax, byte [rel rom_size]
+	imul	eax, eax, 10
+	add	al, bl
+	cmp	al, 0x40
+	ja	.inputerror
+	cmp	al, 0x00
+	je	.inputerror
+	mov	[rel rom_size], al
+		
+.filenamereadsetup:
 	; set up rcx as a counter to measure string length
 	; clear rax for handling the data
 	; load rbx with the pointer stored in arg1p
 	; load rdi with a pointer to filename
 	xor	rcx, rcx
 	xor	rax, rax
-	mov	rbx, [rel arg1p]
+	mov	rbx, [rel arg3p]
 	lea	rdi, [rel filename]
 	
 .filenamereadloop:
@@ -444,7 +539,7 @@ _start:
 	mov	rdx, 1
 	lea	rsi, [rel endl]
 	call	printtext
-	jmp	.closefile
+	jmp	; this time we go to a new part of the routine instead of closing
 	
 .printfailure:
 	mov	rdx, error4len
@@ -477,7 +572,26 @@ _start:
 	mov	rdx, 1
 	lea	rsi, [rel endl]
 	call	printtext
-	jmp	.closefile	
+	jmp	.closefile
+
+.refresh_file:
+	; performs an LSEEK operation to reset the file read location
+	; to the beginning of the file, then read a character
+	; until we come upon the first ':'
+	;
+	; RAX - syscall 8
+	; EDI - the file descriptor
+	; RSI - 0 bytes offset from the origin
+	; RDX - 0 for origin being the start of the file
+	mov	rax, 8
+	mov	edi, [rel fd1]
+	xor	rsi, rsi
+	xor	rdx, rdx
+	syscall
+	test	rax, rax
+	js	.fileerror
+	
+.serialport_open:	
 	
 .usageonly:
 	; with no input, the program displays a message
@@ -531,6 +645,24 @@ _start:
 	inc	byte [rel is_valid]
 	mov	rdx, error2len
 	lea	rsi, [rel error2]
+	call	printtext
+	jmp	.closefile
+	
+.serialerror_open:
+	mov	rdx, SPErr1len
+	lea	rsi, [rel SPErr1]
+	call	printtext
+	jmp	.closefile
+	
+.serialerror_write:
+	mov	rdx, SPErr2len
+	lea	rsi, [rel SPErr2]
+	call	printtext
+	jmp	.closefile
+
+.serialerror_read:
+	mov	rdx, SPErr3len
+	lea	rsi, [rel SPErr3]
 	call	printtext
 	jmp	.closefile
 
