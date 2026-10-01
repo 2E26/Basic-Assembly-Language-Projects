@@ -57,7 +57,7 @@ section .data
   u1len:	equ	$ - usage1
   usage2:	db	"Validates a HEX file and writes it to ROM via a PIC16F877A", 0x0A
   u2len:	equ	$ - usage2
-  usage3:	db	"-s NN: enter a two-digit ROM size in kilobytes.", 0x0A
+  usage3:	db	"-s NN: enter a one or two-digit ROM size in kilobytes.", 0x0A
   u3len:	equ	$ - usage3
   usage4:	db	"inputfile.hex - an Intel HEX file containing code for loading into the ROM", 0x0A
   u4len:	equ	$ - usage4
@@ -81,6 +81,8 @@ section .data
   error6len:	equ	$ - error6
   error7:	db	"Error - no HEX data in file.", 0x0A
   error7len:	equ	$ - error7
+  error8:	db	"Error - internal error. You royally fucked up somehow.", 0x0A
+  error8len:	equ	$ - error8
   
   success1:	db	"HEX file is valid.", 0x0A, 0x0A
   success1len:	equ	$ - success1
@@ -131,6 +133,7 @@ section .bss
   chksumtotal:	resb	1				; running total for checksum
   is_valid:	resb	1				; a flag that allows certain other functions to declare the file invalid
   rom_size	resb	1				; used to store the ROM size
+  addr_change	resb	1				; -1 (0xFF) if we need to update the address before writing
 
 section .text
 
@@ -139,23 +142,22 @@ _start:
 	; this is commonly thought of as unnecessary, but
 	; ensures we don't have to deal with leftover garbage
 	; data when the program is hundreds of lines long
-
-	xor	rax, rax
-	mov	qword [rel argc], rax
-	mov	qword [rel arg1p], rax
-	mov	word [rel address], ax
-	mov	dword [rel fd1], eax
-	mov	byte [rel inputptr], al
-	mov	byte [rel outputptr], al
-	mov	byte [rel byteqty], al
-	mov	byte [rel temp1], al
-	mov	byte [rel chksumtotal], al
-	mov	byte [rel rom_size], al
+	mov	qword [rel argc], 0x0000000000000000
+	mov	qword [rel arg1p], 0x0000000000000000
+	mov	word [rel address], 0x0000
+	mov	dword [rel fd1], 0x00000000
+	mov	byte [rel inputptr], 0x00
+	mov	byte [rel outputptr], 0x00
+	mov	byte [rel byteqty], 0x00
+	mov	byte [rel temp1], 0x00
+	mov	byte [rel chksumtotal], 0x00
+	mov	byte [rel rom_size], 0x00
 	
 .memclear:
 	; batch clear the memory buffers before reading/writing
 	; to them.
 	cld
+	mov	rax, 0x00
 	mov	rcx, 0x100
 	lea	rdi, [rel inbuf]
 	rep	stosb
@@ -539,7 +541,7 @@ _start:
 	mov	rdx, 1
 	lea	rsi, [rel endl]
 	call	printtext
-	jmp	; this time we go to a new part of the routine instead of closing
+	jmp	.refresh_file
 	
 .printfailure:
 	mov	rdx, error4len
@@ -590,8 +592,249 @@ _start:
 	syscall
 	test	rax, rax
 	js	.fileerror
+	mov	rdx, 0x01
+	mov	edi, [rel fd1]
+	lea	rsi, [rel inbuf]
+.refresh_file_loop:
+	call	readfile
+	test	rax, rax
+	js	.readerror
+	jz	.eoferror	
+	mov	al, [rsi]
+	cmp	al, 0x3A
+	jne	.refresh_file_loop
 	
-.serialport_open:	
+.serialport_open:
+	lea	rdi, [rel SerPortName]
+	mov	rsi, 2
+	xor	rdx, rdx
+	call	openfile
+	test	rax, rax
+	js	.serialerror_open
+	mov	dword[rel fd2], eax
+	
+.programming:
+	; prepare to program the PIC.
+	; clear the input pointer and other variables
+	mov	byte [rel inputptr], 0x00
+	mov	byte [rel byteqty], 0x00
+	mov	word [rel address], 0x0000
+	mov	byte [rel addr_change], 0xFF
+	xor	r12, r12
+	
+.programming_loop:
+	; start reading the record
+	; at this point we have already read the colon marking the
+	; beginning of the record. When we come back to this point
+	; we should be at the same point on the new record
+	;
+	; the first step is to read the record's byte quantity
+	; (default is 0x20) and store it in memory. Store
+	; in R12 to use as a counter later
+	call	ReadIHEXbyte
+	jc	.readerror
+	mov	byte [rel byteqty], al
+	movzx	r12, byte [rel byteqty]
+	
+.programming_address:
+	; read and stuff the address to the PIC
+	;
+	; the address is stored in sequential order in a HEX file,
+	; but will be stored in little endian in memory. So,
+	; we read and stuff the high address byte first
+	; and then read and stuff the low byte
+	;
+	; we only do the next part if the later stages tell us to.
+	; addr_change is set to -1 if we have to update the address
+	; that keeps the program from updating it if we haven't
+	; performed a write yet.
+	;
+	; once that is done, check if the address is within
+	; the size of ROM and send it to the PIC. The PIC will
+	; update its programming address
+	call	ReadIHEXByte
+	jc	.readerror
+	mov	byte [rel address + 1], al
+	call	ReadIHEXByte
+	jc	.readerror
+	mov	byte [rel address], al
+	cmp	byte [rel addr_change], 0xFF
+	jne	.programming_type
+	; perform a check to see if the address is higher than
+	; what we've alleged the ROM can handle
+	;
+	; example: ROM is 32 kB
+	; device size is 0x20, or 0b00100000
+	; maximum address is 0x7FFF
+	; so, copy the device size into AL and multiply by four
+	; AL = 0b10000000, or 0x80
+	; compare the address high byte to AL. If AL is higher,
+	; we have a valid address. If AL is equal or lower,
+	; the address entered is not valid.
+	;
+	; if stated ROM size is 64 (unlikely), we treat every
+	; address as valid and keep moving.
+	;
+	; note that this check does not validate whether a
+	; 64-byte write operation will go over the edge of ROM.
+	; that is performed by the PIC. 
+	mov	al, byte [rel rom_size]
+	cmp	al, 0x40
+	je	.programming_address_writeaddress
+	shl	al, 2
+	cmp	al, byte [rel address + 1]
+	jbe	; need to have an invalid address handler
+	; otherwise, we send an "A" command with
+	; the hexadecimal representation of the address bytes
+	
+.programming_address_writeaddress:
+	; send the PIC a command to change the working address.
+	; literally "A xxxx/n", where xxxx is the four-character
+	; address we want to write. Then, clear the flag we
+	; use to indicate an address write happens.
+	mov	al, 0x41
+	mov	[rel temp1], al
+	mov	edx, 0x01
+	mov	edi, [rel fd2]
+	lea	rsi, [rel temp1]
+	call	writefile
+	mov	al, 0x20
+	mov	[rel temp1], al
+	call	writefile
+	mov	al, [rel address + 1]
+	and	al, 0xF0
+	shr	al, 4
+	call	NibbletoASCII
+	jc	.internalerror
+	mov	[rel temp1], al
+	call	writefile
+	mov	al, [rel address + 1]
+	and	al, 0x0F
+	call	NibbletoASCII
+	jc	.internalerror
+	mov	[rel temp1], al
+	call	writefile
+	mov	al, [rel address]
+	and	al, 0xF0
+	shr	al, 4
+	call	NibbletoASCII
+	jc	.internalerror
+	mov	[rel temp1], al
+	call	writefile
+	mov	al, [rel address]
+	and	al, 0x0F
+	call	NibbletoASCII
+	jc	.internalerror
+	mov	[rel temp1], al
+	call	writefile
+	mov	al, 0x0D
+	mov	[rel temp1], al
+	call	writefile	
+	mov	byte [rel addr_change], 0x00
+	; once we've written the direction to change addresses,
+	; we need to read bytes from the PIC over serial data
+	; until we receive the response bits.
+	mov	edx, 0x01
+	mov	edi, [rel fd2]
+	lea	rsi, [rel temp1]
+.programming_address_response:
+	call	readfile
+	cmp	byte [rel temp1], 0x06
+	je	; success
+	cmp	byte [rel temp1], 0x15
+	je	; failure
+	jmp	.programming_address_response
+.programming_address_success:
+	; the success message from the PIC is 0x060004
+	; 0x06 for success
+	; 0x00 for no details
+	; 0x04 for end of transmission
+	;
+	; draw a byte from the PIC and keep doing it until
+	; we get the 0x04 token. Don't care about the null
+	; space character
+	call	readfile
+	cmp	byte [rel temp1], 0x04
+	jne	.programming_address_success
+	jmp	.programming_type
+.programming_address_fail:
+	; the failure message from the PIC is 0x15__04
+	; the error code allows the PIC to indicate what
+	; the problem is.
+	;
+	; for this routine, the PIC sends a 0x06 code if
+	; the address 
+	call	readfile
+	cmp	byte [rel temp1], 0x04
+	jne	; not sure where right this minute
+	jmp	; read line 769
+	
+.programming_type:
+	; read the file type to see if we are at the end
+	call	ReadIHEXByte
+	jc	.readerror
+	mov	byte [rel rectype], al
+	cmp	al, 0x01
+	jne	.programming_read_data
+	jmp	; end of programming - we found the end of file record
+	
+.programming_read_data:
+	; start reading data bytes from the record. Store them in the
+	; output buffer. Keep going until we are out of bytes in the
+	; current record or we hit 64 bytes in the buffer.
+	;
+	; 1) read two ASCII characters from the file. Convert to a byte value and
+	;    store in AL
+	; 2) if the read failed, error out
+	; 3) place the output pointer value in RBX
+	; 4) point to the buffer address in RSI
+	; 5) store the value in AL into memory at RSI + RBX (outputbuffer[outputptr])
+	; 6) decrement R12, the byte counter
+	; 7) increment output pointer
+	; 8) R12 = 0? if so, go to clearing the record and return to read the next one
+	; 9) outputptr = 64? if so, go to writing the data to the PIC. Clear outputptr
+	; 10) if neither are true, repeat all of these steps again
+	call	ReadIHEXByte
+	jc	.readerror
+	movzx	rbx, byte [rel outputptr]
+	lea	rsi, [rel outbuf]
+	mov	byte [rsi + rbx], al
+	inc	byte [rel outputptr]
+	dec	r12
+	jz	.programming_consume_endofrecord
+	mov	al, [rel outputptr]
+	cmp	al, 0x40
+	jne	.programming_read_data
+	jmp	.programming_fill_page
+	
+.programming_consume_endofrecord:
+	; read bytes from the file until one is ":". That aligns
+	; us to the next record. Then checks if the output pointer
+	; is 64, meaning we still have memory writing to do
+	mov	rdx, 0x01
+	mov	edi, [rel fd1]
+	lea	rsi, [rel temp1]
+	call	readfile
+	test	rax, rax
+	js	.readerror
+	jz	.eoferror
+	mov	al, [rel temp1]
+	cmp	al, 0x3A
+	jne	.programming_consume_endofrecord
+	mov	al, [rel outputptr]
+	cmp	al, 0x40
+	je	.programming_fill_page
+	jmp	.programming_loop
+	
+.programming_fill_page:
+	; send data bytes to the PIC
+	xor	r11, r11
+
+.programming_write_ROM:
+	; instruct PIC to write to the ROM
+
+
+
 	
 .usageonly:
 	; with no input, the program displays a message
@@ -649,22 +892,33 @@ _start:
 	jmp	.closefile
 	
 .serialerror_open:
-	mov	rdx, SPErr1len
-	lea	rsi, [rel SPErr1]
+	mov	rdx, SPErr01len
+	lea	rsi, [rel SPErr01]
 	call	printtext
-	jmp	.closefile
+	jmp	.closeserial
 	
 .serialerror_write:
-	mov	rdx, SPErr2len
-	lea	rsi, [rel SPErr2]
+	mov	rdx, SPErr02len
+	lea	rsi, [rel SPErr02]
 	call	printtext
-	jmp	.closefile
+	jmp	.closeserial
 
 .serialerror_read:
-	mov	rdx, SPErr3len
-	lea	rsi, [rel SPErr3]
+	mov	rdx, SPErr03len
+	lea	rsi, [rel SPErr03]
 	call	printtext
-	jmp	.closefile
+	jmp	.closeserial
+	
+.internalerror:
+	mov	rdx, error8len
+	lea	rsi, [rel error8]
+	call	printtext
+	jmp	.closeserial
+	
+.closeserial:
+	xor	rdi
+	mov	edi, [rel fd2]
+	call	closefile
 
 .closefile:
 	xor	rdi, rdi
@@ -948,7 +1202,7 @@ ReadIHEXByte:
 ; Converts an ASCII value hexadecimal character in AL to its respective
 ; numerical value, returns it in the lower nibble of AL   
 ; 
-; Inputs: AL - hexadecimal character used to 
+; Inputs: AL - ASCII character representing a value from 0-15
 ; Destroys: AL
 ; Outputs: AL - value of hexadecimal character
 ; 	   Carry - set if read failed
@@ -980,3 +1234,30 @@ ASCIItoHEX:
 .ASCIItoHEX_fail:
 		stc
 		ret
+
+;--------------------------------------------------------------------
+; Subroutine: NibbletoASCII
+; 
+; Converts the lower four bits in AL to an ASCII character
+; 
+; Inputs: AL - 0x0000nnnn, where nnnn represents a value 0-15
+; Destroys: AL
+; Outputs: AL - ASCII character 0x30-0x39 or 0x41-0x46
+; 	   Carry - set if read failed
+;--------------------------------------------------------------------
+NibbletoASCII:
+	cmp	al, 0x0A
+	jae	.NibbletoASCII_letter
+	add	al, 0x30
+	clc
+	ret
+.NibbletoASCII_letter:
+	cmp	al, 0x0F
+	ja	.NibbletoASCII_error
+	add	al, 0x37
+	clc
+	ret
+.NibbletoASCII_error:
+	xor	al, al
+	stc
+	ret
