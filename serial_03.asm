@@ -34,6 +34,7 @@
 ; 2) refresh the file counter (lseek) and establish serial connection with the PIC
 ;
 ; 3) write the program to EEPROM
+;   0 - send a command for the ROM size
 ;   a - find the first data record
 ;   b - read the amount of bytes and the address. Read and ignore the type
 ;   c - set the PIC programming address to the record's beginning address
@@ -46,6 +47,16 @@
 ;   i - print a display message stating that we wrote N bytes to ROM
 ;
 ;--------------------------------------------------------------------------------------------------
+
+; Passdown log
+; Date of last entry: 22 October 2026
+;
+; What was done: 
+;
+; What is next:  
+;
+; I don't know:  
+;
 
 global _start
 
@@ -134,6 +145,7 @@ section .bss
   is_valid:	resb	1				; a flag that allows certain other functions to declare the file invalid
   rom_size	resb	1				; used to store the ROM size
   addr_change	resb	1				; -1 (0xFF) if we need to update the address before writing
+  decimal_flag	resb	1				; 0 if we print decimal to screen, 1 to print to serial port
 
 section .text
 
@@ -529,6 +541,7 @@ _start:
 	lea	rsi, [rel success2]
 	call	printtext
 	mov	ax, r8w
+	mov	[rel decimal_flag], 0x00
 	call	printdecimal
 	mov	rdx, 1
 	lea	rsi, [rel endl]
@@ -537,6 +550,7 @@ _start:
 	lea	rsi, [rel success4]
 	call	printtext
 	mov	ax, r10w
+	mov	[rel decimal_flag], 0x00
 	call	printdecimal
 	mov	rdx, 1
 	lea	rsi, [rel endl]
@@ -554,6 +568,7 @@ _start:
 	lea	rsi, [rel success2]
 	call	printtext
 	mov	ax, r8w
+	mov	[rel decimal_flag], 0x00
 	call	printdecimal
 	mov	rdx, 1
 	lea	rsi, [rel endl]
@@ -562,6 +577,7 @@ _start:
 	lea	rsi, [rel success3]
 	call	printtext
 	mov	ax, r9w
+	mov	[rel decimal_flag], 0x00
 	call	printdecimal
 	mov	rdx, 1
 	lea	rsi, [rel endl]
@@ -570,6 +586,7 @@ _start:
 	lea	rsi, [rel success4]
 	call	printtext
 	mov	ax, r10w
+	mov	[rel decimal_flag], 0x00
 	call	printdecimal
 	mov	rdx, 1
 	lea	rsi, [rel endl]
@@ -613,9 +630,69 @@ _start:
 	js	.serialerror_open
 	mov	dword[rel fd2], eax
 	
+.declare_size:
+	; before the PIC will do anything, I need to
+	; make sure it knows the size of the ROM we are
+	; writing to. Otherwise it will ignore all
+	; other commands.
+	;
+	; 1) send "S ##/n" to the PIC. This lets the PIC
+	;    know what size ROM we are working with.
+	; 2) read the PIC response until we find either 6
+	;    (success) or 21 (failure). 
+	mov	al, 0x53
+	mov	[rel temp1], al
+	mov	edx, 0x01
+	mov	edi, [rel fd2]
+	lea	rsi, [rel temp1]
+	call	writefile
+	mov	al, 0x20
+	mov	[rel temp1], al
+	call	writefile
+	xor	rax, rax
+	mov	al, [rel rom_size]
+	mov	byte [rel decimal_flag], 1
+	call	printdecimal
+	mov	al, 0x0D
+	mov	[rel temp1], al
+	mov	edx, 0x01
+	mov	edi, [rel fd2]
+	lea	rsi, [rel temp1]
+	call	writefile
+.declare_size_response:
+	call	readfile
+	cmp	byte [rel temp1], 0x06
+	je	.declare_size_success
+	cmp	byte [rel temp1], 0x15
+	je	.declare_size_fail
+	jmp	.declare_size_response
+.declare_size_success:
+	call	readfile
+	test	rax, rax
+	js	.serialerror_read
+	jz	.serialerror_read
+	cmp	byte [rel temp1], 0x04
+	jne	.declare_size_success
+	jmp	.programming
+.declare_size_fail:
+	call	readfile
+	test	rax, rax
+	js	.serialerror_read
+	jz	.serialerror_read
+	cmp	byte [rel temp1], 0x04
+	jne	; not sure where right this minute
+	jmp	; read line above
+		
 .programming:
 	; prepare to program the PIC.
 	; clear the input pointer and other variables
+	;
+	; inputptr is used by ReadIHEXByte
+	; byteqty tracks the number of bytes in the current record
+	; address is used to store the starting address of the current record
+	; addr_change is a flag that indicates whether we need to update the address
+	; r12 is a down counter that is used to determine how many bytes are left
+	;
 	mov	byte [rel inputptr], 0x00
 	mov	byte [rel byteqty], 0x00
 	mov	word [rel address], 0x0000
@@ -629,8 +706,8 @@ _start:
 	; we should be at the same point on the new record
 	;
 	; the first step is to read the record's byte quantity
-	; (default is 0x20) and store it in memory. Store
-	; in R12 to use as a counter later
+	; (default is 0x20, or 32 bytes) and store it in memory. 
+	; Store in R12 to use as a counter later
 	call	ReadIHEXbyte
 	jc	.readerror
 	mov	byte [rel byteqty], al
@@ -729,21 +806,29 @@ _start:
 	call	writefile
 	mov	al, 0x0D
 	mov	[rel temp1], al
-	call	writefile	
+	call	writefile
+	; clear the address change flag and set up the registers
+	; to start reading the PIC's response
 	mov	byte [rel addr_change], 0x00
-	; once we've written the direction to change addresses,
-	; we need to read bytes from the PIC over serial data
-	; until we receive the response bits.
 	mov	edx, 0x01
 	mov	edi, [rel fd2]
 	lea	rsi, [rel temp1]
+	
 .programming_address_response:
+	; read bytes from the serial port that the PIC has sent
+	; back. If the read results in RAX <= 0, error out.
+	; Check if the read byte is 6 or 21. If neither, read
+	; another byte. Go to success (6) or failure (21). 
 	call	readfile
+	test	rax, rax
+	js	.serialerror_read
+	jz	.serialerror_read
 	cmp	byte [rel temp1], 0x06
-	je	; success
+	je	.programming_address_success
 	cmp	byte [rel temp1], 0x15
-	je	; failure
+	je	.programming_address_fail
 	jmp	.programming_address_response
+	
 .programming_address_success:
 	; the success message from the PIC is 0x060004
 	; 0x06 for success
@@ -754,9 +839,13 @@ _start:
 	; we get the 0x04 token. Don't care about the null
 	; space character
 	call	readfile
+	test	rax, rax
+	js	.serialerror_read
+	jz	.serialerror_read
 	cmp	byte [rel temp1], 0x04
 	jne	.programming_address_success
 	jmp	.programming_type
+	
 .programming_address_fail:
 	; the failure message from the PIC is 0x15__04
 	; the error code allows the PIC to indicate what
@@ -765,6 +854,9 @@ _start:
 	; for this routine, the PIC sends a 0x06 code if
 	; the address 
 	call	readfile
+	test	rax, rax
+	js	.serialerror_read
+	jz	.serialerror_read
 	cmp	byte [rel temp1], 0x04
 	jne	; not sure where right this minute
 	jmp	; read line 769
@@ -802,8 +894,7 @@ _start:
 	inc	byte [rel outputptr]
 	dec	r12
 	jz	.programming_consume_endofrecord
-	mov	al, [rel outputptr]
-	cmp	al, 0x40
+	cmp	byte [rel outputptr], 0x40
 	jne	.programming_read_data
 	jmp	.programming_fill_page
 	
@@ -814,26 +905,154 @@ _start:
 	mov	rdx, 0x01
 	mov	edi, [rel fd1]
 	lea	rsi, [rel temp1]
+	
+.programming_consume_endofrecord_loop:
 	call	readfile
 	test	rax, rax
 	js	.readerror
 	jz	.eoferror
-	mov	al, [rel temp1]
-	cmp	al, 0x3A
-	jne	.programming_consume_endofrecord
-	mov	al, [rel outputptr]
-	cmp	al, 0x40
+	cmp	byte [rel temp1], 0x3A
+	jne	.programming_consume_endofrecord_loop
+	cmp	byte [rel outputptr], 0x40
 	je	.programming_fill_page
 	jmp	.programming_loop
 	
 .programming_fill_page:
-	; send data bytes to the PIC
-	xor	r11, r11
-
+	; initialize registers to send data bytes to the PIC
+	; R13 will count up until it equals outputptr
+	; rax (well, AL) will get data from outbuf, convert it to
+	; ASCII characters, and then have them sent over serial
+	; to the PIC two at a time.
+	xor	r13, r13
+	xor	rax, rax
+	; send the basic command to initiate the fill operation
+	; 1) send characters "P", " ", and then the number of
+	;    bytes to send in decimal. Finally, the end line
+	;    character is sent.
+	; 2) read characters from the serial port until we have
+	;    the EOF message sent by the PIC, and make sure
+	;    we get the success message.
+	mov	al, 0x50
+	mov	[rel temp1], al
+	mov	edx, 0x01
+	mov	edi, [rel fd2]
+	lea	rsi, [rel temp1]
+	call	writefile
+	mov	al, 0x20
+	mov	[rel temp1], al
+	call	writefile
+	; get the number of bytes we are going to write 
+	mov	al, [rel outputptr]
+	mov	byte [rel decimal_flag], 0x01
+	call	printdecimal
+	mov	al, 0x0D
+	mov	[rel temp1], al
+	call	writefile
+	
+.programming_fill_response:
+	; read bytes from the serial port that the PIC has sent
+	; back. If the read results in RAX <= 0, error out.
+	; Check if the read byte is 6 or 21. If neither, read
+	; another byte. Go to success (6) or failure (21). 
+	call	readfile
+	test	rax, rax
+	js	.serialerror_read
+	jz	.serialerror_read
+	cmp	byte [rel temp1], 0x06
+	je	.programming_fill_success
+	cmp	byte [rel temp1], 0x15
+	je	.programming_fill_fail
+	jmp	.programming_fill_response
+	
+.programming_fill_success:
+	; the success message from the PIC is 0x060004
+	; 0x06 for success
+	; 0x00 for no details
+	; 0x04 for end of transmission
+	;
+	; draw a byte from the PIC and keep doing it until
+	; we get the 0x04 token. Don't care about the null
+	; space character
+	call	readfile
+	test	rax, rax
+	js	.serialerror_read
+	jz	.serialerror_read
+	cmp	byte [rel temp1], 0x04
+	jne	.programming_fill_success
+	jmp	.programming_fill_sendbytes
+	
+.programming_fill_fail:
+	; the failure message from the PIC is 0x15__04
+	; the error code allows the PIC to indicate what
+	; the problem is.
+	call	readfile
+	test	rax, rax
+	js	.serialerror_read
+	jz	.serialerror_read
+	cmp	byte [rel temp1], 0x04
+	jne	; not sure where right this minute
+	jmp	; read above
+	
+.programming_fill_sendbytes:
+	; set up the program for serial writing. R13 is a write
+	; counter that stops writing when we meet the value
+	; stored in outputptr
+	mov	edx, 0x01
+	mov	edi, [rel fd2]
+	xor	rax, rax
+	
+.programming_fill_sendbytes_loop:
+	; read a byte from the output buffer, translate it
+	; into ASCII, and send it out on the serial port.
+	; This happens twice, once for the high nibble and
+	; then the low nibble.
+	; 
+	; Example - byte read is 0x3A.
+	;
+	; 1) - mask off the low nibble (0x30)
+	; 2) - shift right four (0x03)
+	; 3) - convert to ASCII (0x33, '3')
+	; 4) - send '3' over serial
+	; 5) - read the byte again (0x3A)
+	; 6) - mask off the high nibble (0x0A)
+	; 7) - convert to ASCII (0x41, 'A')
+	; 8) - send 'A' over serial
+	; 9) - increment R13
+	; A) - if R13 equals outputptr, we are done
+	; B) - if not, read the next byte and keep going
+	;
+	; below we read, convert, and send the first ASCII character
+	;
+	movzx	rbx, byte [rel outputptr]
+	lea	rsi, [rel outbuf]
+	mov	al, [rsi + rbx]
+	and	al, 0xF0
+	shr	al, 4
+	call	NibbletoASCII
+	jc	.internalerror
+	mov	[rel temp1], al
+	lea	rsi, [rel temp1]
+	call	writefile
+	; now we do the second one
+	lea	rsi, [rel outbuf]
+	mov	al, [rsi + rbx]
+	and	al, 0x0F
+	call	NibbletoASCII
+	jc	.internalerror
+	mov	[rel temp1], al
+	lea	rsi, [rel temp1]
+	call	writefile
+	; writing is complete. Increment the byte counter
+	; and see if we hit the limit.
+	inc	r13
+	cmp	r13b, [rel outputptr]
+	jb	.programming_fill_sendbytes_loop
+	; we make it here when R13 is equal to the number in
+	; the output pointer. We are done sending bytes.
+		
+	
 .programming_write_ROM:
 	; instruct PIC to write to the ROM
-
-
 
 	
 .usageonly:
@@ -955,10 +1174,12 @@ printtext:
 ; BH - counts how many characters are printed
 ; BL - counts what character to print
 ; DX - contains the subtraction value
+; Byte Decimal_Flag - 0 to print to the screen, 1 to print to the serial port
 ; 
-; Inputs: AX - binary value we want to print to screen
+; Inputs: AX - binary value we want to print to screen/serial port
+;	  Decimal_Flag - where to print the result
 ; Destroys: AX, BX, DX, Temp1
-; Outputs: Printed characters to screen
+; Outputs: Printed characters to screen or serial port
 ;--------------------------------------------------------------------
 printdecimal:
 		; initialize registers
@@ -991,7 +1212,14 @@ printdecimal:
 		push	rdx
 		push	rax
 		mov	rdx, 0x01
+		cmp	byte [rel decimal_flag], 0x00
+		jnz	.printdecimal_next_serial
 		call	printtext
+		jmp	.printdecimal_next_finish
+.printdecimal_next_serial:
+		mov	edi, [rel fd2]
+		call	writefile
+.printdecimal_next_finish:
 		pop	rax
 		pop	rdx
 		inc	bh
@@ -1008,7 +1236,14 @@ printdecimal:
 		push	rdx
 		push	rax
 		mov	rdx, 0x01
+		cmp	byte [rel decimal_flag], 0x00
+		jnz	.printdecimal_zerohandler_serial
 		call	printtext
+		jmp	.printdecimal_zerohandler_finish
+.printdecimal_zerohandler_serial:
+		mov	edi, [rel fd2]
+		call	writefile
+.printdecimal_zerohandler_finish:
 		pop	rax
 		pop	rdx
 		inc	bh
@@ -1054,7 +1289,14 @@ printdecimal:
 		push	rdx
 		push	rax
 		mov	rdx, 0x01
+		cmp	byte [rel decimal_flag], 0x00
+		jnz	.printdecimal_end_serial
 		call	printtext
+		jmp	.printdecimal_end_finish
+.printdecimal_end_serial:
+		mov	edi, [rel fd2]
+		call	writefile
+.printdecimal_end_finish:	
 		pop	rax
 		pop	rdx
 .printdecimal_goback:
