@@ -49,13 +49,25 @@
 ;--------------------------------------------------------------------------------------------------
 
 ; Passdown log
-; Date of last entry: 22 October 2026
+; Date of last entry: 23 October 2026
 ;
-; What was done: 
+; What was done: I wrote the code for responding to a PIC-reported fault into a subroutine
+;		 and replaced the repetitive functions with calls to that routine. I also
+;		 started a subroutine to analyze the fault code and produce the appropriate
+;		 error message. Errors will almost certainly end in programs exiting.
 ;
-; What is next:  
+; What is next:  Finish the error code handler. Write the code to perform a block write to
+;		 the EEPROM. Once a block write is performed, come up with a way to display
+;		 results and then end the program. In later versions, I could add a
+;		 command to read the EEPROM and display the contents on screen. That's also
+;		 a complex task to be done with this simpler programmer-controller.
 ;
-; I don't know:  
+; I don't know:  what else needs to be done with this program once the above is done. I still
+;		 should write extra code to ensure I'm not butchering the intended address
+;		 structure of the program. If I remember correctly, I placed the text dump
+;		 for my program in a different area of ROM than the program code. I'm also
+;		 going to need to place the code into defined areas when I make other tools
+;		 for the monitor program to use.
 ;
 
 global _start
@@ -146,6 +158,7 @@ section .bss
   rom_size	resb	1				; used to store the ROM size
   addr_change	resb	1				; -1 (0xFF) if we need to update the address before writing
   decimal_flag	resb	1				; 0 if we print decimal to screen, 1 to print to serial port
+  PIC_status	resb	1				; used to return a fault code issued by the PIC
 
 section .text
 
@@ -659,29 +672,10 @@ _start:
 	mov	edi, [rel fd2]
 	lea	rsi, [rel temp1]
 	call	writefile
-.declare_size_response:
-	call	readfile
-	cmp	byte [rel temp1], 0x06
-	je	.declare_size_success
-	cmp	byte [rel temp1], 0x15
-	je	.declare_size_fail
-	jmp	.declare_size_response
-.declare_size_success:
-	call	readfile
-	test	rax, rax
-	js	.serialerror_read
-	jz	.serialerror_read
-	cmp	byte [rel temp1], 0x04
-	jne	.declare_size_success
-	jmp	.programming
-.declare_size_fail:
-	call	readfile
-	test	rax, rax
-	js	.serialerror_read
-	jz	.serialerror_read
-	cmp	byte [rel temp1], 0x04
-	jne	; not sure where right this minute
-	jmp	; read line above
+	; read the serial stream until we read the success/fail bytes
+	call	PIC_Response
+	jnc	.programming
+	call	PIC_Fault
 		
 .programming:
 	; prepare to program the PIC.
@@ -814,53 +808,11 @@ _start:
 	mov	edi, [rel fd2]
 	lea	rsi, [rel temp1]
 	
-.programming_address_response:
-	; read bytes from the serial port that the PIC has sent
-	; back. If the read results in RAX <= 0, error out.
-	; Check if the read byte is 6 or 21. If neither, read
-	; another byte. Go to success (6) or failure (21). 
-	call	readfile
-	test	rax, rax
-	js	.serialerror_read
-	jz	.serialerror_read
-	cmp	byte [rel temp1], 0x06
-	je	.programming_address_success
-	cmp	byte [rel temp1], 0x15
-	je	.programming_address_fail
-	jmp	.programming_address_response
-	
-.programming_address_success:
-	; the success message from the PIC is 0x060004
-	; 0x06 for success
-	; 0x00 for no details
-	; 0x04 for end of transmission
-	;
-	; draw a byte from the PIC and keep doing it until
-	; we get the 0x04 token. Don't care about the null
-	; space character
-	call	readfile
-	test	rax, rax
-	js	.serialerror_read
-	jz	.serialerror_read
-	cmp	byte [rel temp1], 0x04
-	jne	.programming_address_success
-	jmp	.programming_type
-	
-.programming_address_fail:
-	; the failure message from the PIC is 0x15__04
-	; the error code allows the PIC to indicate what
-	; the problem is.
-	;
-	; for this routine, the PIC sends a 0x06 code if
-	; the address 
-	call	readfile
-	test	rax, rax
-	js	.serialerror_read
-	jz	.serialerror_read
-	cmp	byte [rel temp1], 0x04
-	jne	; not sure where right this minute
-	jmp	; read line 769
-	
+	; read the serial stream until we read the success/fail bytes
+	call	PIC_Response
+	jnc	.programming_type
+	call	PIC_Fault	
+
 .programming_type:
 	; read the file type to see if we are at the end
 	call	ReadIHEXByte
@@ -949,49 +901,10 @@ _start:
 	mov	[rel temp1], al
 	call	writefile
 	
-.programming_fill_response:
-	; read bytes from the serial port that the PIC has sent
-	; back. If the read results in RAX <= 0, error out.
-	; Check if the read byte is 6 or 21. If neither, read
-	; another byte. Go to success (6) or failure (21). 
-	call	readfile
-	test	rax, rax
-	js	.serialerror_read
-	jz	.serialerror_read
-	cmp	byte [rel temp1], 0x06
-	je	.programming_fill_success
-	cmp	byte [rel temp1], 0x15
-	je	.programming_fill_fail
-	jmp	.programming_fill_response
-	
-.programming_fill_success:
-	; the success message from the PIC is 0x060004
-	; 0x06 for success
-	; 0x00 for no details
-	; 0x04 for end of transmission
-	;
-	; draw a byte from the PIC and keep doing it until
-	; we get the 0x04 token. Don't care about the null
-	; space character
-	call	readfile
-	test	rax, rax
-	js	.serialerror_read
-	jz	.serialerror_read
-	cmp	byte [rel temp1], 0x04
-	jne	.programming_fill_success
-	jmp	.programming_fill_sendbytes
-	
-.programming_fill_fail:
-	; the failure message from the PIC is 0x15__04
-	; the error code allows the PIC to indicate what
-	; the problem is.
-	call	readfile
-	test	rax, rax
-	js	.serialerror_read
-	jz	.serialerror_read
-	cmp	byte [rel temp1], 0x04
-	jne	; not sure where right this minute
-	jmp	; read above
+	; read the serial stream until we read the success/fail bytes
+	call	PIC_Response
+	jnc	.programming_fill_sendbytes
+	call	PIC_Fault	
 	
 .programming_fill_sendbytes:
 	; set up the program for serial writing. R13 is a write
@@ -1023,9 +936,8 @@ _start:
 	;
 	; below we read, convert, and send the first ASCII character
 	;
-	movzx	rbx, byte [rel outputptr]
 	lea	rsi, [rel outbuf]
-	mov	al, [rsi + rbx]
+	mov	al, [rsi + r13]
 	and	al, 0xF0
 	shr	al, 4
 	call	NibbletoASCII
@@ -1035,7 +947,7 @@ _start:
 	call	writefile
 	; now we do the second one
 	lea	rsi, [rel outbuf]
-	mov	al, [rsi + rbx]
+	mov	al, [rsi + r13]
 	and	al, 0x0F
 	call	NibbletoASCII
 	jc	.internalerror
@@ -1049,11 +961,14 @@ _start:
 	jb	.programming_fill_sendbytes_loop
 	; we make it here when R13 is equal to the number in
 	; the output pointer. We are done sending bytes.
-		
+
+	; read the serial stream until we read the success/fail bytes
+	call	PIC_Response
+	jnc	.programming_write_ROM
+	call	PIC_Fault	
 	
 .programming_write_ROM:
 	; instruct PIC to write to the ROM
-
 	
 .usageonly:
 	; with no input, the program displays a message
@@ -1503,3 +1418,84 @@ NibbletoASCII:
 	xor	al, al
 	stc
 	ret
+	
+;--------------------------------------------------------------------
+; Subroutine: PIC_Response
+; 
+; Reads bytes from the serial data port until we receive a specific
+; code given by the PIC. The PIC will send serial text messages to
+; communicate with a user. After the text, a three-byte code is sent.
+;
+; A success code will be 0x060004.
+;
+; A failed code will be 0x15nn04, where nn is a fault code.
+;
+; Fault codes: 
+;
+; 0x01 - invalid input
+; 0x02 - excessive input
+; 0x03 - increment error
+; 0x04 - decrement error
+; 0x05 - ROM size not specified
+; 0x06 - Address out of bounds
+; 0x07 - Block excess demand error
+; 0x08 - Block address invalid error
+; 
+; Inputs: none
+; Destroys: EDX, EDI, RSI, RAX
+; Outputs: Carry clear if PIC reports success
+;	   Carry set if PIC sends an error code
+;	   PIC_status contains the error code
+;	   serial read errors exit the program
+;--------------------------------------------------------------------
+PIC_Response:
+	mov	edx, 0x01
+	mov	edi, [rel fd2]
+	lea	rsi, [rel temp1]
+	mov	byte [rel PIC_status], 0x00
+.PIC_Response_loop:
+	call	readfile
+	test	rax, rax
+	js	.serialerror_read
+	jz	.serialerror_read
+	cmp	byte [rel temp1], 0x06
+	je	.PIC_Response_success
+	cmp	byte [rel temp1], 0x15
+	je	.PIC_Response_fail
+	jmp	.PIC_Response_loop
+.PIC_Response_success:
+	call	readfile
+	test	rax, rax
+	js	.serialerror_read
+	jz	.serialerror_read
+	cmp	byte [rel temp1], 0x04
+	jne	.PIC_Response_success
+	clc
+	ret
+.PIC_Response_fail:
+	call	readfile
+	test	rax, rax
+	js	.serialerror_read
+	jz	.serialerror_read
+	mov	al, [rel temp1]
+	mov	[rel PIC_status], al
+.PIC_Response_fail_01:
+	call	readfile
+	test	rax, rax
+	js	.serialerror_read
+	jz	.serialerror_read
+	cmp	byte [rel temp1], 0x04
+	jne	.PIC_Response_fail_01
+	stc
+	ret
+	
+;--------------------------------------------------------------------
+; Subroutine: PIC_Fault
+; 
+; 
+; Inputs: PIC_status contains the fault code read from the serial stream 
+; Destroys: 
+; Outputs: displays relevant error message and then exits program
+;
+;--------------------------------------------------------------------
+PIC_Fault:
